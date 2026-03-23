@@ -1,7 +1,7 @@
 server:
   bind_address: "0.0.0.0"
-  management_port: 3211
-  api_port: 3210
+  management_port: 3141
+  api_port: 3140
 
 wechat:
   base_url: "https://ilinkai.weixin.qq.com"
@@ -22,7 +22,7 @@ lowcode_ws:
   forward_enabled: false
 
 channel_gateway:
-  inbound_token: "replace-with-wechat-outbound-token"
+  inbound_token: ""
 
 logging:
   level: "info"

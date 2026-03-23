@@ -100,11 +100,11 @@ fn default_bind_address() -> String {
 }
 
 fn default_management_port() -> u16 {
-    3211
+    3141
 }
 
 fn default_api_port() -> u16 {
-    3210
+    3140
 }
 
 fn default_base_url() -> String {

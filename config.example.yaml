@@ -1,0 +1,29 @@
+server:
+  bind_address: "0.0.0.0"
+  management_port: 3211
+  api_port: 3210
+
+wechat:
+  base_url: "https://ilinkai.weixin.qq.com"
+
+runtime:
+  event_retention_per_tenant: 200
+  poll_retry_seconds: 3
+  poll_timeout_seconds: 35
+
+database:
+  url: "mysql://root:password@127.0.0.1:3306/wechat?charset=utf8mb4"
+  max_connections: 20
+  connect_timeout: 5
+  idle_timeout: 60
+
+lowcode_ws:
+  base_url: "http://127.0.0.1:4012"
+  forward_enabled: false
+
+channel_gateway:
+  inbound_token: "replace-with-wechat-outbound-token"
+
+logging:
+  level: "info"
+  log_dir: "logs"

@@ -1,0 +1,112 @@
+{
+  "name": "wechat",
+  "description": "微信通道模块，支持扫码登录、long-poll 收消息和 external-managed 生命周期。",
+  "managedMode": "external-managed",
+  "category": "connector",
+  "propertyDefinition": [
+    {
+      "name": "serviceBaseUrl",
+      "type": {
+        "@type": "DataType",
+        "type": "string",
+        "nullable": false
+      },
+      "description": "wechat 业务 API 地址，例如 http://127.0.0.1:3210",
+      "required": true,
+      "isSensitive": false,
+      "defaultValue": "http://127.0.0.1:3210"
+    },
+    {
+      "name": "managementBaseUrl",
+      "type": {
+        "@type": "DataType",
+        "type": "string",
+        "nullable": true
+      },
+      "description": "wechat 管理 API 地址，例如 http://127.0.0.1:3211",
+      "required": false,
+      "isSensitive": false,
+      "defaultValue": "http://127.0.0.1:3211"
+    },
+    {
+      "name": "tenantId",
+      "type": {
+        "@type": "DataType",
+        "type": "string",
+        "nullable": false
+      },
+      "description": "微信租户 ID",
+      "required": true,
+      "isSensitive": false
+    },
+    {
+      "name": "botToken",
+      "type": {
+        "@type": "DataType",
+        "type": "string",
+        "nullable": true
+      },
+      "description": "已存在的微信 iLink bot token；为空时走扫码登录",
+      "required": false,
+      "isSensitive": true
+    },
+    {
+      "name": "baseUrl",
+      "type": {
+        "@type": "DataType",
+        "type": "string",
+        "nullable": true
+      },
+      "description": "微信 iLink API 地址",
+      "required": false,
+      "isSensitive": false,
+      "defaultValue": "https://ilinkai.weixin.qq.com"
+    },
+    {
+      "name": "gatewayUrl",
+      "type": {
+        "@type": "DataType",
+        "type": "string",
+        "nullable": true
+      },
+      "description": "channel-gateway 渠道根地址",
+      "required": false,
+      "isSensitive": false
+    },
+    {
+      "name": "gatewayToken",
+      "type": {
+        "@type": "DataType",
+        "type": "string",
+        "nullable": true
+      },
+      "description": "channel-gateway inbound 鉴权 token",
+      "required": false,
+      "isSensitive": true
+    },
+    {
+      "name": "lowcodeForwardEnabled",
+      "type": {
+        "@type": "DataType",
+        "type": "boolean",
+        "nullable": true
+      },
+      "description": "是否启用 lowcode/channel-gateway 转发",
+      "required": false,
+      "isSensitive": false,
+      "defaultValue": true
+    },
+    {
+      "name": "autoStart",
+      "type": {
+        "@type": "DataType",
+        "type": "boolean",
+        "nullable": true
+      },
+      "description": "是否自动启动轮询 worker",
+      "required": false,
+      "isSensitive": false,
+      "defaultValue": true
+    }
+  ]
+}

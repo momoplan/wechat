@@ -457,6 +457,8 @@ fn build_runtime_status(
 
 fn success_response(data: ExternalModuleResponseData) -> HttpResponse {
     HttpResponse::Ok().json(json!({
+        "errorCode": "0",
+        "value": "成功",
         "code": 0,
         "message": "success",
         "data": data
@@ -465,6 +467,8 @@ fn success_response(data: ExternalModuleResponseData) -> HttpResponse {
 
 fn success_json_response<T: Serialize>(data: T) -> HttpResponse {
     HttpResponse::Ok().json(json!({
+        "errorCode": "0",
+        "value": "成功",
         "code": 0,
         "message": "success",
         "data": data
@@ -472,8 +476,11 @@ fn success_json_response<T: Serialize>(data: T) -> HttpResponse {
 }
 
 fn fail_response(message: impl ToString) -> HttpResponse {
+    let message = message.to_string();
     HttpResponse::Ok().json(json!({
+        "errorCode": "1",
+        "value": message,
         "code": 1,
-        "message": message.to_string()
+        "message": message
     }))
 }

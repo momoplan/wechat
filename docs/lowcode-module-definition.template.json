@@ -5,30 +5,6 @@
   "category": "connector",
   "propertyDefinition": [
     {
-      "name": "serviceBaseUrl",
-      "type": {
-        "@type": "DataType",
-        "type": "string",
-        "nullable": false
-      },
-      "description": "wechat 业务 API 地址，例如 http://127.0.0.1:3140",
-      "required": true,
-      "isSensitive": false,
-      "defaultValue": "http://127.0.0.1:3140"
-    },
-    {
-      "name": "managementBaseUrl",
-      "type": {
-        "@type": "DataType",
-        "type": "string",
-        "nullable": true
-      },
-      "description": "wechat 管理 API 地址，例如 http://127.0.0.1:3141",
-      "required": false,
-      "isSensitive": false,
-      "defaultValue": "http://127.0.0.1:3141"
-    },
-    {
       "name": "tenantId",
       "type": {
         "@type": "DataType",

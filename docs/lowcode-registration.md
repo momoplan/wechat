@@ -80,9 +80,9 @@ cat docs/module-property-definition.json | jq -c .
 - 默认服务名建议为 `wechat`
 - `managedMode` 设为 `external-managed`
 - `propertyDefinition` 里至少包含：
-  - `serviceBaseUrl`
   - `tenantId`
   - `botToken`
+  - `baseUrl`
   - `gatewayUrl`
   - `gatewayToken`
   - `lowcodeForwardEnabled`

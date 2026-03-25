@@ -94,9 +94,15 @@ async fn create_external_module(
         request.properties.clone(),
         request.current_properties.clone(),
     );
-    let external_id = resolve_external_id(&request, &properties);
+    let external_id = match resolve_external_id(&request, &properties) {
+        Ok(value) => value,
+        Err(err) => return fail_response(err),
+    };
     let existing = read_existing_credential(state.get_ref(), &external_id).await;
-    let mut next = build_credential(&properties, existing.as_ref(), true);
+    let mut next = match build_credential(&properties, existing.as_ref(), true) {
+        Ok(value) => value,
+        Err(err) => return fail_response(err),
+    };
     if let Err(err) = normalize_credential(&mut next) {
         return fail_response(err.to_string());
     }
@@ -143,23 +149,38 @@ async fn get_external_module(
 
     let summary = tenant.summary().await;
     let mut properties = Map::new();
-    properties.insert("tenantId".to_string(), Value::String(external_id.clone()));
-    properties.insert("instanceId".to_string(), Value::String(external_id.clone()));
-    properties.insert("externalId".to_string(), Value::String(external_id.clone()));
+    properties.insert(
+        "tenantId".to_string(),
+        data_string_value(external_id.clone()),
+    );
+    properties.insert(
+        "instanceId".to_string(),
+        data_string_value(external_id.clone()),
+    );
+    properties.insert(
+        "externalId".to_string(),
+        data_string_value(external_id.clone()),
+    );
     if let Some(base_url) = summary.api_base_url.clone() {
-        properties.insert("baseUrl".to_string(), Value::String(base_url));
+        properties.insert("baseUrl".to_string(), data_string_value(base_url));
     }
     if let Some(account_id) = summary.account_id.clone() {
-        properties.insert("accountId".to_string(), Value::String(account_id));
+        properties.insert("accountId".to_string(), data_string_value(account_id));
     }
     if let Some(user_id) = summary.user_id.clone() {
-        properties.insert("userId".to_string(), Value::String(user_id));
+        properties.insert("userId".to_string(), data_string_value(user_id));
     }
     if let Some(url) = summary.lowcode_ws_base_url.clone() {
-        properties.insert("gatewayUrl".to_string(), Value::String(url));
+        properties.insert(
+            "gatewayUrl".to_string(),
+            external_service_reference_value(url),
+        );
     }
     if let Some(enabled) = summary.lowcode_forward_enabled {
-        properties.insert("lowcodeForwardEnabled".to_string(), Value::Bool(enabled));
+        properties.insert(
+            "lowcodeForwardEnabled".to_string(),
+            data_bool_value(enabled),
+        );
     }
     if let Some(module_id) = normalize_optional(query.module_id.clone()) {
         properties.insert("moduleId".to_string(), Value::String(module_id));
@@ -214,7 +235,7 @@ async fn delete_external_module(
         status: "DELETED".to_string(),
         properties: {
             let mut map = Map::new();
-            map.insert("tenantId".to_string(), Value::String(external_id));
+            map.insert("tenantId".to_string(), data_string_value(external_id));
             map
         },
     })
@@ -232,7 +253,10 @@ async fn stop_external_module(
     let _ = state.stop_tenant_worker(&tenant).await;
     let summary = tenant.summary().await;
     let mut properties = Map::new();
-    properties.insert("tenantId".to_string(), Value::String(external_id.clone()));
+    properties.insert(
+        "tenantId".to_string(),
+        data_string_value(external_id.clone()),
+    );
 
     success_response(ExternalModuleResponseData {
         instance_id: external_id.clone(),
@@ -250,7 +274,11 @@ async fn update_properties(
 ) -> HttpResponse {
     let request = payload.into_inner();
     let properties = request.properties.clone().unwrap_or_default();
-    let Some(external_id) = resolve_target_external_id(&request, &properties) else {
+    let external_id = match resolve_target_external_id(&request, &properties) {
+        Ok(value) => value,
+        Err(err) => return fail_response(err),
+    };
+    let Some(external_id) = external_id else {
         return success_response(ExternalModuleResponseData {
             instance_id: "".to_string(),
             id: "".to_string(),
@@ -264,12 +292,18 @@ async fn update_properties(
         Some(value) => value,
         None => return fail_response(format!("外部实例不存在: {external_id}")),
     };
-    let mut next = build_credential(&properties, Some(&existing), existing.is_enabled());
+    let mut next = match build_credential(&properties, Some(&existing), existing.is_enabled()) {
+        Ok(value) => value,
+        Err(err) => return fail_response(err),
+    };
     if let Err(err) = normalize_credential(&mut next) {
         return fail_response(err.to_string());
     }
 
-    if let Some(auto_start) = extract_bool(&properties, &["autoStart", "auto_start"]) {
+    if let Some(auto_start) = match extract_data_bool(&properties, &["autoStart", "auto_start"]) {
+        Ok(value) => value,
+        Err(err) => return fail_response(err),
+    } {
         next.enabled = Some(auto_start);
     }
 
@@ -309,68 +343,167 @@ async fn read_existing_credential(
 fn resolve_external_id(
     request: &ExternalModuleCreateRequest,
     properties: &Map<String, Value>,
-) -> String {
-    normalize_optional(request.tenant_id.clone())
-        .or_else(|| extract_string(properties, &["tenantId", "tenant_id"]))
-        .unwrap_or_else(|| Uuid::new_v4().to_string())
+) -> Result<String, String> {
+    if let Some(external_id) = normalize_optional(request.tenant_id.clone()) {
+        return Ok(external_id);
+    }
+
+    Ok(extract_data_string(properties, &["tenantId", "tenant_id"])?
+        .unwrap_or_else(|| Uuid::new_v4().to_string()))
 }
 
 fn resolve_target_external_id(
     request: &ExternalModuleUpdatePropertiesRequest,
     properties: &Map<String, Value>,
-) -> Option<String> {
-    normalize_optional(request.tenant_id.clone()).or_else(|| {
-        extract_string(
+) -> Result<Option<String>, String> {
+    if let Some(external_id) = normalize_optional(request.tenant_id.clone()) {
+        return Ok(Some(external_id));
+    }
+
+    Ok(
+        extract_data_string(properties, &["tenantId", "tenant_id"])?.or(extract_data_string(
             properties,
-            &["tenantId", "tenant_id", "externalId", "external_id"],
-        )
-    })
+            &["externalId", "external_id"],
+        )?),
+    )
 }
 
 fn build_credential(
     properties: &Map<String, Value>,
     existing: Option<&TenantCredential>,
     enabled_default: bool,
-) -> TenantCredential {
-    TenantCredential {
-        bot_token: extract_string(properties, &["botToken", "bot_token", "token"])
+) -> Result<TenantCredential, String> {
+    Ok(TenantCredential {
+        bot_token: extract_data_string(properties, &["botToken", "bot_token", "token"])?
             .or_else(|| existing.and_then(|value| value.bot_token.clone())),
-        api_base_url: extract_string(properties, &["baseUrl", "apiBaseUrl", "api_base_url"])
+        api_base_url: extract_data_string(properties, &["baseUrl", "apiBaseUrl", "api_base_url"])?
             .or_else(|| existing.and_then(|value| value.api_base_url.clone())),
-        account_id: extract_string(properties, &["accountId", "account_id"])
+        account_id: extract_data_string(properties, &["accountId", "account_id"])?
             .or_else(|| existing.and_then(|value| value.account_id.clone())),
-        user_id: extract_string(properties, &["userId", "user_id"])
+        user_id: extract_data_string(properties, &["userId", "user_id"])?
             .or_else(|| existing.and_then(|value| value.user_id.clone())),
         sync_buf: existing.and_then(|value| value.sync_buf.clone()),
-        lowcode_ws_base_url: extract_string(properties, &["gatewayUrl", "gateway_url"])
-            .or_else(|| existing.and_then(|value| value.lowcode_ws_base_url.clone())),
-        lowcode_ws_token: extract_string(properties, &["gatewayToken", "gateway_token"])
+        lowcode_ws_base_url: extract_external_service_reference_url(
+            properties,
+            &["gatewayUrl", "gateway_url"],
+        )?
+        .or_else(|| existing.and_then(|value| value.lowcode_ws_base_url.clone())),
+        lowcode_ws_token: extract_data_string(properties, &["gatewayToken", "gateway_token"])?
             .or_else(|| existing.and_then(|value| value.lowcode_ws_token.clone())),
-        lowcode_forward_enabled: extract_bool(
+        lowcode_forward_enabled: extract_data_bool(
             properties,
             &["lowcodeForwardEnabled", "lowcode_forward_enabled"],
-        )
+        )?
         .or_else(|| existing.and_then(|value| value.lowcode_forward_enabled)),
         enabled: Some(
-            extract_bool(properties, &["autoStart", "auto_start"])
+            extract_data_bool(properties, &["autoStart", "auto_start"])?
                 .or_else(|| existing.map(|value| value.is_enabled()))
                 .unwrap_or(enabled_default),
         ),
-    }
-}
-
-fn extract_string(properties: &Map<String, Value>, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| {
-        properties
-            .get(*key)
-            .and_then(Value::as_str)
-            .and_then(|value| normalize_optional(Some(value.to_string())))
     })
 }
 
-fn extract_bool(properties: &Map<String, Value>, keys: &[&str]) -> Option<bool> {
+fn extract_data_string(
+    properties: &Map<String, Value>,
+    keys: &[&str],
+) -> Result<Option<String>, String> {
+    let Some((key, value)) = find_property(properties, keys) else {
+        return Ok(None);
+    };
+    let raw = extract_typed_value(value, key, "Data")?;
+    match raw {
+        Value::Null => Ok(None),
+        Value::String(text) => Ok(normalize_optional(Some(text.clone()))),
+        _ => Err(format!("属性 {key} 的 Data.value 必须为字符串")),
+    }
+}
+
+fn extract_data_bool(
+    properties: &Map<String, Value>,
+    keys: &[&str],
+) -> Result<Option<bool>, String> {
+    let Some((key, value)) = find_property(properties, keys) else {
+        return Ok(None);
+    };
+    let raw = extract_typed_value(value, key, "Data")?;
+    match raw {
+        Value::Null => Ok(None),
+        Value::Bool(flag) => Ok(Some(*flag)),
+        _ => Err(format!("属性 {key} 的 Data.value 必须为布尔值")),
+    }
+}
+
+fn extract_external_service_reference_url(
+    properties: &Map<String, Value>,
+    keys: &[&str],
+) -> Result<Option<String>, String> {
+    let Some((key, value)) = find_property(properties, keys) else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("属性 {key} 必须为 ExternalServiceReference 类型"))?;
+    let type_name = object
+        .get("@type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("属性 {key} 必须为 ExternalServiceReference 类型"))?;
+    if type_name != "ExternalServiceReference" {
+        return Err(format!("属性 {key} 必须为 ExternalServiceReference 类型"));
+    }
+    let url = object
+        .get("url")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("属性 {key} 的 ExternalServiceReference.url 必须为字符串"))?;
+    Ok(normalize_optional(Some(url.to_string())))
+}
+
+fn find_property<'a>(
+    properties: &'a Map<String, Value>,
+    keys: &[&'a str],
+) -> Option<(&'a str, &'a Value)> {
     keys.iter()
-        .find_map(|key| properties.get(*key).and_then(Value::as_bool))
+        .find_map(|key| properties.get(*key).map(|value| (*key, value)))
+}
+
+fn extract_typed_value<'a>(
+    value: &'a Value,
+    key: &str,
+    expected_type: &str,
+) -> Result<&'a Value, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("属性 {key} 必须为 {expected_type} 类型"))?;
+    let type_name = object
+        .get("@type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("属性 {key} 必须为 {expected_type} 类型"))?;
+    if type_name != expected_type {
+        return Err(format!("属性 {key} 必须为 {expected_type} 类型"));
+    }
+    object
+        .get("value")
+        .ok_or_else(|| format!("属性 {key} 缺少 {expected_type}.value"))
+}
+
+fn data_string_value(value: impl Into<String>) -> Value {
+    json!({
+        "@type": "Data",
+        "value": value.into()
+    })
+}
+
+fn data_bool_value(value: bool) -> Value {
+    json!({
+        "@type": "Data",
+        "value": value
+    })
+}
+
+fn external_service_reference_value(url: impl Into<String>) -> Value {
+    json!({
+        "@type": "ExternalServiceReference",
+        "url": url.into()
+    })
 }
 
 fn merge_response_properties(
@@ -380,31 +513,37 @@ fn merge_response_properties(
 ) -> Map<String, Value> {
     properties.insert(
         "tenantId".to_string(),
-        Value::String(external_id.to_string()),
+        data_string_value(external_id.to_string()),
     );
     properties.insert(
         "instanceId".to_string(),
-        Value::String(external_id.to_string()),
+        data_string_value(external_id.to_string()),
     );
     properties.insert(
         "externalId".to_string(),
-        Value::String(external_id.to_string()),
+        data_string_value(external_id.to_string()),
     );
     properties.insert("loggedIn".to_string(), Value::Bool(summary.logged_in));
     if let Some(base_url) = summary.api_base_url.clone() {
-        properties.insert("baseUrl".to_string(), Value::String(base_url));
+        properties.insert("baseUrl".to_string(), data_string_value(base_url));
     }
     if let Some(account_id) = summary.account_id.clone() {
-        properties.insert("accountId".to_string(), Value::String(account_id));
+        properties.insert("accountId".to_string(), data_string_value(account_id));
     }
     if let Some(user_id) = summary.user_id.clone() {
-        properties.insert("userId".to_string(), Value::String(user_id));
+        properties.insert("userId".to_string(), data_string_value(user_id));
     }
     if let Some(url) = summary.lowcode_ws_base_url.clone() {
-        properties.insert("gatewayUrl".to_string(), Value::String(url));
+        properties.insert(
+            "gatewayUrl".to_string(),
+            external_service_reference_value(url),
+        );
     }
     if let Some(enabled) = summary.lowcode_forward_enabled {
-        properties.insert("lowcodeForwardEnabled".to_string(), Value::Bool(enabled));
+        properties.insert(
+            "lowcodeForwardEnabled".to_string(),
+            data_bool_value(enabled),
+        );
     }
     properties
 }
@@ -483,4 +622,100 @@ fn fail_response(message: impl ToString) -> HttpResponse {
         "code": 1,
         "message": message
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_credential_requires_typed_values() {
+        let properties = Map::from_iter([
+            (
+                "baseUrl".to_string(),
+                json!({"@type":"Data","value":"https://ilinkai.weixin.qq.com"}),
+            ),
+            (
+                "gatewayUrl".to_string(),
+                json!({"@type":"ExternalServiceReference","url":"https://example.com/inbound"}),
+            ),
+            (
+                "lowcodeForwardEnabled".to_string(),
+                json!({"@type":"Data","value":true}),
+            ),
+            (
+                "autoStart".to_string(),
+                json!({"@type":"Data","value":true}),
+            ),
+        ]);
+
+        let credential =
+            build_credential(&properties, None, false).expect("typed values should parse");
+        assert_eq!(
+            credential.lowcode_ws_base_url.as_deref(),
+            Some("https://example.com/inbound")
+        );
+        assert_eq!(credential.lowcode_forward_enabled, Some(true));
+        assert_eq!(credential.enabled, Some(true));
+        assert_eq!(
+            credential.api_base_url.as_deref(),
+            Some("https://ilinkai.weixin.qq.com")
+        );
+    }
+
+    #[test]
+    fn build_credential_rejects_plain_gateway_url() {
+        let properties = Map::from_iter([(
+            "gatewayUrl".to_string(),
+            Value::String("https://example.com/inbound".to_string()),
+        )]);
+
+        let error =
+            build_credential(&properties, None, false).expect_err("plain string must be rejected");
+        assert!(error.contains("gatewayUrl"));
+        assert!(error.contains("ExternalServiceReference"));
+    }
+
+    #[test]
+    fn resolve_target_external_id_reads_data_value() {
+        let request = ExternalModuleUpdatePropertiesRequest::default();
+        let properties = Map::from_iter([(
+            "tenantId".to_string(),
+            json!({"@type":"Data","value":"tenant-123"}),
+        )]);
+
+        let external_id =
+            resolve_target_external_id(&request, &properties).expect("typed tenantId should parse");
+        assert_eq!(external_id.as_deref(), Some("tenant-123"));
+    }
+
+    #[test]
+    fn merge_response_properties_returns_typed_values() {
+        let summary = crate::models::TenantSummary {
+            tenant_id: "tenant-123".to_string(),
+            logged_in: true,
+            bot_token_masked: None,
+            api_base_url: Some("https://ilinkai.weixin.qq.com".to_string()),
+            account_id: None,
+            user_id: None,
+            lowcode_ws_base_url: Some("https://example.com/inbound".to_string()),
+            lowcode_forward_enabled: Some(true),
+            enabled: true,
+            connection: crate::models::ConnectionStatus::default(),
+        };
+
+        let properties = merge_response_properties(Map::new(), "tenant-123", &summary);
+        assert_eq!(
+            properties.get("tenantId"),
+            Some(&json!({"@type":"Data","value":"tenant-123"}))
+        );
+        assert_eq!(
+            properties.get("gatewayUrl"),
+            Some(&json!({"@type":"ExternalServiceReference","url":"https://example.com/inbound"}))
+        );
+        assert_eq!(
+            properties.get("lowcodeForwardEnabled"),
+            Some(&json!({"@type":"Data","value":true}))
+        );
+    }
 }

@@ -373,6 +373,9 @@ fn build_credential(
     existing: Option<&TenantCredential>,
     enabled_default: bool,
 ) -> Result<TenantCredential, String> {
+    let gateway_reference =
+        extract_external_service_reference(properties, &["gatewayUrl", "gateway_url"])?;
+
     Ok(TenantCredential {
         bot_token: extract_data_string(properties, &["botToken", "bot_token", "token"])?
             .or_else(|| existing.and_then(|value| value.bot_token.clone())),
@@ -383,12 +386,16 @@ fn build_credential(
         user_id: extract_data_string(properties, &["userId", "user_id"])?
             .or_else(|| existing.and_then(|value| value.user_id.clone())),
         sync_buf: existing.and_then(|value| value.sync_buf.clone()),
-        lowcode_ws_base_url: extract_external_service_reference_url(
-            properties,
-            &["gatewayUrl", "gateway_url"],
-        )?
-        .or_else(|| existing.and_then(|value| value.lowcode_ws_base_url.clone())),
+        lowcode_ws_base_url: gateway_reference
+            .as_ref()
+            .and_then(|value| value.url.clone())
+            .or_else(|| existing.and_then(|value| value.lowcode_ws_base_url.clone())),
         lowcode_ws_token: extract_data_string(properties, &["gatewayToken", "gateway_token"])?
+            .or_else(|| {
+                gateway_reference
+                    .as_ref()
+                    .and_then(|value| value.token.clone())
+            })
             .or_else(|| existing.and_then(|value| value.lowcode_ws_token.clone())),
         lowcode_forward_enabled: extract_data_bool(
             properties,
@@ -433,10 +440,16 @@ fn extract_data_bool(
     }
 }
 
-fn extract_external_service_reference_url(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalServiceReferencePayload {
+    url: Option<String>,
+    token: Option<String>,
+}
+
+fn extract_external_service_reference(
     properties: &Map<String, Value>,
     keys: &[&str],
-) -> Result<Option<String>, String> {
+) -> Result<Option<ExternalServiceReferencePayload>, String> {
     let Some((key, value)) = find_property(properties, keys) else {
         return Ok(None);
     };
@@ -454,7 +467,19 @@ fn extract_external_service_reference_url(
         .get("url")
         .and_then(Value::as_str)
         .ok_or_else(|| format!("属性 {key} 的 ExternalServiceReference.url 必须为字符串"))?;
-    Ok(normalize_optional(Some(url.to_string())))
+    let token = match object.get("token") {
+        Some(Value::Null) | None => None,
+        Some(Value::String(text)) => normalize_optional(Some(text.clone())),
+        Some(_) => {
+            return Err(format!(
+                "属性 {key} 的 ExternalServiceReference.token 必须为字符串"
+            ));
+        }
+    };
+    Ok(Some(ExternalServiceReferencePayload {
+        url: normalize_optional(Some(url.to_string())),
+        token,
+    }))
 }
 
 fn find_property<'a>(
@@ -637,7 +662,11 @@ mod tests {
             ),
             (
                 "gatewayUrl".to_string(),
-                json!({"@type":"ExternalServiceReference","url":"https://example.com/inbound"}),
+                json!({
+                    "@type":"ExternalServiceReference",
+                    "url":"https://example.com/inbound",
+                    "token":"binding-token"
+                }),
             ),
             (
                 "lowcodeForwardEnabled".to_string(),
@@ -655,11 +684,40 @@ mod tests {
             credential.lowcode_ws_base_url.as_deref(),
             Some("https://example.com/inbound")
         );
+        assert_eq!(
+            credential.lowcode_ws_token.as_deref(),
+            Some("binding-token")
+        );
         assert_eq!(credential.lowcode_forward_enabled, Some(true));
         assert_eq!(credential.enabled, Some(true));
         assert_eq!(
             credential.api_base_url.as_deref(),
             Some("https://ilinkai.weixin.qq.com")
+        );
+    }
+
+    #[test]
+    fn build_credential_uses_explicit_gateway_token_over_reference_token() {
+        let properties = Map::from_iter([
+            (
+                "gatewayUrl".to_string(),
+                json!({
+                    "@type":"ExternalServiceReference",
+                    "url":"https://example.com/inbound",
+                    "token":"binding-token"
+                }),
+            ),
+            (
+                "gatewayToken".to_string(),
+                json!({"@type":"Data","value":"explicit-token"}),
+            ),
+        ]);
+
+        let credential =
+            build_credential(&properties, None, false).expect("typed values should parse");
+        assert_eq!(
+            credential.lowcode_ws_token.as_deref(),
+            Some("explicit-token")
         );
     }
 

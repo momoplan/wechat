@@ -3,9 +3,12 @@ use crate::models::{SendTextMessageRequest, TenantCredential};
 use crate::state::{AppState, TenantContext};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use image::{DynamicImage, ImageFormat, Luma};
+use qrcode::QrCode;
 use rand::Rng as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::io::Cursor;
 use std::sync::Arc;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -53,6 +56,55 @@ fn normalize_base_url(value: &str) -> String {
 fn random_wechat_uin() -> String {
     let value = rand::rng().random::<u32>().to_string();
     BASE64_STANDARD.encode(value)
+}
+
+pub fn normalize_login_qr_image_data_url(value: &str) -> Result<String, ServiceError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(ServiceError::Upstream(
+            "微信未返回可用的二维码内容".to_string(),
+        ));
+    }
+
+    if trimmed.starts_with("data:image/") {
+        return Ok(trimmed.to_string());
+    }
+
+    if looks_like_base64(trimmed) {
+        return Ok(format!("data:image/png;base64,{trimmed}"));
+    }
+
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return build_png_qr_data_url(trimmed);
+    }
+
+    Err(ServiceError::Upstream(format!(
+        "未识别的二维码内容格式: {trimmed}"
+    )))
+}
+
+fn looks_like_base64(value: &str) -> bool {
+    !value.is_empty()
+        && value.len().is_multiple_of(4)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
+}
+
+fn build_png_qr_data_url(content: &str) -> Result<String, ServiceError> {
+    let qrcode = QrCode::new(content.as_bytes())
+        .map_err(|err| ServiceError::Internal(format!("生成二维码失败: {err}")))?;
+    let image = qrcode
+        .render::<Luma<u8>>()
+        .min_dimensions(280, 280)
+        .quiet_zone(true)
+        .build();
+    let mut output = Cursor::new(Vec::new());
+    DynamicImage::ImageLuma8(image)
+        .write_to(&mut output, ImageFormat::Png)
+        .map_err(|err| ServiceError::Internal(format!("编码二维码图片失败: {err}")))?;
+    let encoded = BASE64_STANDARD.encode(output.into_inner());
+    Ok(format!("data:image/png;base64,{encoded}"))
 }
 
 fn build_headers(token: &str) -> Vec<(&'static str, String)> {
@@ -137,6 +189,35 @@ pub async fn fetch_login_qrcode(
 
     serde_json::from_value(body)
         .map_err(|err| ServiceError::Upstream(format!("解析二维码响应失败: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_login_qr_image_data_url;
+
+    #[test]
+    fn keeps_existing_data_url() {
+        let value = "data:image/png;base64,abc123";
+        let normalized = normalize_login_qr_image_data_url(value).expect("normalize data url");
+        assert_eq!(normalized, value);
+    }
+
+    #[test]
+    fn wraps_plain_base64_as_png_data_url() {
+        let normalized =
+            normalize_login_qr_image_data_url("YWJjZA==").expect("normalize base64 payload");
+        assert_eq!(normalized, "data:image/png;base64,YWJjZA==");
+    }
+
+    #[test]
+    fn generates_png_data_url_from_login_page_url() {
+        let normalized = normalize_login_qr_image_data_url(
+            "https://liteapp.weixin.qq.com/q/7GiQu1?qrcode=test&bot_type=3",
+        )
+        .expect("normalize login url");
+        assert!(normalized.starts_with("data:image/png;base64,"));
+        assert!(normalized.len() > "data:image/png;base64,".len());
+    }
 }
 
 pub async fn poll_login_status(

@@ -201,11 +201,15 @@ async fn create_login_qrcode(
     let response =
         wechat_api::fetch_login_qrcode(state.get_ref(), &tenant, payload.base_url.as_deref())
             .await?;
+    let qr_image_data_url =
+        wechat_api::normalize_login_qr_image_data_url(&response.qrcode_img_content)?;
 
     Ok(HttpResponse::Ok().json(json!({
         "tenant_id": tenant_id,
         "qrcode": response.qrcode,
         "url": response.qrcode_img_content,
+        "login_url": response.qrcode_img_content,
+        "qr_image_data_url": qr_image_data_url,
         "ret": response.ret
     })))
 }

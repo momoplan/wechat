@@ -10,6 +10,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::Cursor;
 use std::sync::Arc;
+use tracing::info;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LoginQrResponse {
@@ -133,6 +134,34 @@ async fn parse_api_json(resp: reqwest::Response, endpoint: &str) -> Result<Value
     serde_json::from_str::<Value>(&text).map_err(|err| {
         ServiceError::Upstream(format!("解析微信响应 JSON 失败: {err}; body={text}"))
     })
+}
+
+fn mask_token(value: &str) -> String {
+    let trimmed = value.trim();
+    let len = trimmed.chars().count();
+    if len <= 12 {
+        return "******".to_string();
+    }
+    let prefix: String = trimmed.chars().take(6).collect();
+    let suffix: String = trimmed
+        .chars()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{prefix}******{suffix}")
+}
+
+fn redact_sendmessage_payload(payload: &Value) -> Value {
+    let mut redacted = payload.clone();
+    if let Some(value) = redacted.pointer_mut("/msg/context_token") {
+        if let Some(token) = value.as_str() {
+            *value = Value::String(mask_token(token));
+        }
+    }
+    redacted
 }
 
 fn ensure_success(body: &Value, endpoint: &str) -> Result<(), ServiceError> {
@@ -379,19 +408,48 @@ pub async fn send_text_to_user(
         }
     });
 
+    let log_payload = redact_sendmessage_payload(&body_str);
+    info!(
+        tenant_id = %tenant.tenant_id,
+        user_id,
+        endpoint = %endpoint,
+        payload = %log_payload,
+        "调用微信 sendmessage 请求"
+    );
+
     let mut request = state.http_client.post(&endpoint).json(&body_str);
     for (key, value) in build_headers(token) {
         request = request.header(key, value);
     }
 
-    let body = parse_api_json(
-        request
-            .send()
-            .await
-            .map_err(|err| ServiceError::Upstream(format!("发送微信消息失败: {err}")))?,
-        "sendmessage",
-    )
-    .await?;
+    let response = request
+        .send()
+        .await
+        .map_err(|err| ServiceError::Upstream(format!("发送微信消息失败: {err}")))?;
+    let status = response.status();
+    let raw_body = response
+        .text()
+        .await
+        .map_err(|err| ServiceError::Upstream(format!("读取微信响应失败: {err}")))?;
+    info!(
+        tenant_id = %tenant.tenant_id,
+        user_id,
+        endpoint = %endpoint,
+        status = %status,
+        response_body = %raw_body,
+        "微信 sendmessage 响应"
+    );
+    let body = if !status.is_success() {
+        return Err(ServiceError::Upstream(format!(
+            "sendmessage 返回 HTTP {}: {}",
+            status.as_u16(),
+            raw_body
+        )));
+    } else {
+        serde_json::from_str::<Value>(&raw_body).map_err(|err| {
+            ServiceError::Upstream(format!("解析微信响应 JSON 失败: {err}; body={raw_body}"))
+        })?
+    };
     ensure_success(&body, "sendmessage")?;
     Ok(body)
 }

@@ -114,7 +114,8 @@ async fn create_external_module(
     maybe_restart_worker(state.get_ref(), tenant.clone()).await;
 
     let summary = tenant.summary().await;
-    properties = merge_response_properties(properties, &external_id, &summary);
+    let credential = tenant.credential.read().await.clone();
+    properties = merge_response_properties(properties, &external_id, &summary, &credential);
     if let Some(user_id) = request.user_id {
         properties.insert("userId".to_string(), Value::Number(user_id.into()));
     }
@@ -148,44 +149,11 @@ async fn get_external_module(
     };
 
     let summary = tenant.summary().await;
-    let mut properties = Map::new();
-    properties.insert(
-        "tenantId".to_string(),
-        data_string_value(external_id.clone()),
-    );
-    properties.insert(
-        "instanceId".to_string(),
-        data_string_value(external_id.clone()),
-    );
-    properties.insert(
-        "externalId".to_string(),
-        data_string_value(external_id.clone()),
-    );
-    if let Some(base_url) = summary.api_base_url.clone() {
-        properties.insert("baseUrl".to_string(), data_string_value(base_url));
-    }
-    if let Some(account_id) = summary.account_id.clone() {
-        properties.insert("accountId".to_string(), data_string_value(account_id));
-    }
-    if let Some(user_id) = summary.user_id.clone() {
-        properties.insert("userId".to_string(), data_string_value(user_id));
-    }
-    if let Some(url) = summary.lowcode_ws_base_url.clone() {
-        properties.insert(
-            "gatewayUrl".to_string(),
-            external_service_reference_value(url),
-        );
-    }
-    if let Some(enabled) = summary.lowcode_forward_enabled {
-        properties.insert(
-            "lowcodeForwardEnabled".to_string(),
-            data_bool_value(enabled),
-        );
-    }
+    let credential = tenant.credential.read().await.clone();
+    let mut properties = merge_response_properties(Map::new(), &external_id, &summary, &credential);
     if let Some(module_id) = normalize_optional(query.module_id.clone()) {
         properties.insert("moduleId".to_string(), Value::String(module_id));
     }
-    properties.insert("loggedIn".to_string(), Value::Bool(summary.logged_in));
 
     success_response(ExternalModuleResponseData {
         instance_id: external_id.clone(),
@@ -314,7 +282,9 @@ async fn update_properties(
     maybe_restart_worker(state.get_ref(), tenant.clone()).await;
 
     let summary = tenant.summary().await;
-    let response_properties = merge_response_properties(properties, &external_id, &summary);
+    let credential = tenant.credential.read().await.clone();
+    let response_properties =
+        merge_response_properties(properties, &external_id, &summary, &credential);
     success_response(ExternalModuleResponseData {
         instance_id: external_id.clone(),
         id: external_id.clone(),
@@ -397,6 +367,18 @@ fn build_credential(
                     .and_then(|value| value.token.clone())
             })
             .or_else(|| existing.and_then(|value| value.lowcode_ws_token.clone())),
+        outbound_token: extract_data_string(
+            properties,
+            &[
+                "outboundToken",
+                "outbound_token",
+                "outboundCallbackToken",
+                "callbackToken",
+                "channelCallbackToken",
+            ],
+        )?
+        .or_else(|| existing.and_then(|value| value.outbound_token.clone()))
+        .or_else(|| Some(crate::models::generate_outbound_token())),
         lowcode_forward_enabled: extract_data_bool(
             properties,
             &["lowcodeForwardEnabled", "lowcode_forward_enabled"],
@@ -535,6 +517,7 @@ fn merge_response_properties(
     mut properties: Map<String, Value>,
     external_id: &str,
     summary: &crate::models::TenantSummary,
+    credential: &TenantCredential,
 ) -> Map<String, Value> {
     properties.insert(
         "tenantId".to_string(),
@@ -563,6 +546,9 @@ fn merge_response_properties(
             "gatewayUrl".to_string(),
             external_service_reference_value(url),
         );
+    }
+    if let Some(token) = credential.outbound_token.clone() {
+        properties.insert("outboundToken".to_string(), data_string_value(token));
     }
     if let Some(enabled) = summary.lowcode_forward_enabled {
         properties.insert(
@@ -694,6 +680,14 @@ mod tests {
             credential.api_base_url.as_deref(),
             Some("https://ilinkai.weixin.qq.com")
         );
+        assert!(
+            credential
+                .outbound_token
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some()
+        );
     }
 
     #[test]
@@ -761,8 +755,20 @@ mod tests {
             enabled: true,
             connection: crate::models::ConnectionStatus::default(),
         };
+        let credential = crate::models::TenantCredential {
+            bot_token: None,
+            api_base_url: summary.api_base_url.clone(),
+            account_id: None,
+            user_id: None,
+            sync_buf: None,
+            lowcode_ws_base_url: summary.lowcode_ws_base_url.clone(),
+            lowcode_ws_token: Some("gateway-token".to_string()),
+            outbound_token: Some("outbound-token".to_string()),
+            lowcode_forward_enabled: summary.lowcode_forward_enabled,
+            enabled: Some(true),
+        };
 
-        let properties = merge_response_properties(Map::new(), "tenant-123", &summary);
+        let properties = merge_response_properties(Map::new(), "tenant-123", &summary, &credential);
         assert_eq!(
             properties.get("tenantId"),
             Some(&json!({"@type":"Data","value":"tenant-123"}))
@@ -774,6 +780,10 @@ mod tests {
         assert_eq!(
             properties.get("lowcodeForwardEnabled"),
             Some(&json!({"@type":"Data","value":true}))
+        );
+        assert_eq!(
+            properties.get("outboundToken"),
+            Some(&json!({"@type":"Data","value":"outbound-token"}))
         );
     }
 }

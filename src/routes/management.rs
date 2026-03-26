@@ -298,6 +298,8 @@ pub(crate) fn normalize_credential(credential: &mut TenantCredential) -> Result<
     credential.sync_buf = normalize_optional(credential.sync_buf.take());
     credential.lowcode_ws_base_url = normalize_optional(credential.lowcode_ws_base_url.take());
     credential.lowcode_ws_token = normalize_optional(credential.lowcode_ws_token.take());
+    credential.outbound_token = normalize_optional(credential.outbound_token.take());
+    credential.ensure_outbound_token();
 
     if credential.lowcode_forward_enabled.unwrap_or(false)
         && credential.lowcode_ws_base_url.is_none()

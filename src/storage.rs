@@ -33,7 +33,7 @@ impl TenantStore {
 
     pub async fn list_tenants(&self) -> Result<Vec<PersistedTenant>> {
         let rows = sqlx::query(
-            "SELECT tenant_id, bot_token, api_base_url, account_id, user_id, sync_buf, lowcode_ws_base_url, lowcode_ws_token, lowcode_forward_enabled, enabled FROM wechat_tenant_credentials ORDER BY tenant_id ASC",
+            "SELECT tenant_id, bot_token, api_base_url, account_id, user_id, sync_buf, lowcode_ws_base_url, lowcode_ws_token, outbound_token, lowcode_forward_enabled, enabled FROM wechat_tenant_credentials ORDER BY tenant_id ASC",
         )
         .fetch_all(&self.pool)
         .await
@@ -51,6 +51,7 @@ impl TenantStore {
                     sync_buf: row.get("sync_buf"),
                     lowcode_ws_base_url: row.get("lowcode_ws_base_url"),
                     lowcode_ws_token: row.get("lowcode_ws_token"),
+                    outbound_token: row.get("outbound_token"),
                     lowcode_forward_enabled: row.get("lowcode_forward_enabled"),
                     enabled: row.get("enabled"),
                 },
@@ -67,9 +68,9 @@ impl TenantStore {
         sqlx::query(
             r#"
             INSERT INTO wechat_tenant_credentials (
-              tenant_id, bot_token, api_base_url, account_id, user_id, sync_buf, lowcode_ws_base_url, lowcode_ws_token, lowcode_forward_enabled, enabled
+              tenant_id, bot_token, api_base_url, account_id, user_id, sync_buf, lowcode_ws_base_url, lowcode_ws_token, outbound_token, lowcode_forward_enabled, enabled
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
               bot_token = VALUES(bot_token),
               api_base_url = VALUES(api_base_url),
@@ -78,6 +79,7 @@ impl TenantStore {
               sync_buf = VALUES(sync_buf),
               lowcode_ws_base_url = VALUES(lowcode_ws_base_url),
               lowcode_ws_token = VALUES(lowcode_ws_token),
+              outbound_token = VALUES(outbound_token),
               lowcode_forward_enabled = VALUES(lowcode_forward_enabled),
               enabled = VALUES(enabled),
               updated_at = CURRENT_TIMESTAMP
@@ -91,6 +93,7 @@ impl TenantStore {
         .bind(credential.sync_buf.as_deref())
         .bind(credential.lowcode_ws_base_url.as_deref())
         .bind(credential.lowcode_ws_token.as_deref())
+        .bind(credential.outbound_token.as_deref())
         .bind(credential.lowcode_forward_enabled)
         .bind(credential.enabled.unwrap_or(true))
         .execute(&self.pool)
@@ -144,6 +147,7 @@ impl TenantStore {
               sync_buf TEXT NULL,
               lowcode_ws_base_url VARCHAR(512) NULL,
               lowcode_ws_token VARCHAR(255) NULL,
+              outbound_token VARCHAR(255) NULL,
               lowcode_forward_enabled TINYINT(1) NULL,
               enabled TINYINT(1) NOT NULL DEFAULT 1,
               updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -187,6 +191,11 @@ impl TenantStore {
         self.add_column_if_missing(
             "ALTER TABLE wechat_tenant_credentials ADD COLUMN lowcode_ws_token VARCHAR(255) NULL",
             "lowcode_ws_token",
+        )
+        .await?;
+        self.add_column_if_missing(
+            "ALTER TABLE wechat_tenant_credentials ADD COLUMN outbound_token VARCHAR(255) NULL",
+            "outbound_token",
         )
         .await?;
         self.add_column_if_missing(

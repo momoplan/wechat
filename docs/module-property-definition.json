@@ -56,6 +56,17 @@
     "isSensitive": true
   },
   {
+    "name": "outboundToken",
+    "type": {
+      "@type": "DataType",
+      "type": "string",
+      "nullable": true
+    },
+    "description": "微信模块生成的 outbound 回调鉴权 token，供 gateway 调用 /outbound 时使用",
+    "required": false,
+    "isSensitive": true
+  },
+  {
     "name": "lowcodeForwardEnabled",
     "type": {
       "@type": "DataType",

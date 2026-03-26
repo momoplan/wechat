@@ -69,6 +69,7 @@ cat docs/module-property-definition.json | jq -c .
 说明：
 - `tenantId`：external-module 实例 ID，也会作为租户 ID
 - `gatewayUrl`：channel-gateway 渠道根地址，服务内部会自动拼 `/inbound`
+- `outboundToken`：由微信模块生成并回传，供 gateway 调用模块 `/outbound` 时做 Bearer 鉴权
 - `autoStart=true`：若该租户已经扫码登录，创建后自动启动轮询
 - `autoStart=true` 但尚未登录：实例会创建成功，但状态仍是 `PENDING`
 
@@ -85,6 +86,7 @@ cat docs/module-property-definition.json | jq -c .
   - `baseUrl`
   - `gatewayUrl`
   - `gatewayToken`
+  - `outboundToken`
   - `lowcodeForwardEnabled`
   - `autoStart`
 

@@ -153,6 +153,7 @@ http://<wechat-host>:3211/external-module
 - `userId`
 - `gatewayUrl`
 - `gatewayToken`
+- `outboundToken`
 - `lowcodeForwardEnabled`
 - `autoStart`
 

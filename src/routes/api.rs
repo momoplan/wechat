@@ -108,31 +108,16 @@ async fn handle_channel_callback(
     payload: web::Json<ChannelCallbackRequest>,
     state: web::Data<Arc<AppState>>,
 ) -> Result<HttpResponse, ServiceError> {
-    let expected_token = state
-        .config
-        .channel_gateway
-        .inbound_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|token| !token.is_empty());
-    if !is_callback_authorized(&req, expected_token) {
+    let payload = payload.into_inner();
+    let expected_tokens = resolve_callback_auth_tokens(
+        state.get_ref(),
+        extract_callback_tenant_id(&payload).as_deref(),
+    )
+    .await;
+    if !is_callback_authorized(&req, &expected_tokens) {
         return Err(ServiceError::Unauthorized(
             "channel callback 鉴权失败".to_string(),
         ));
-    }
-
-    let payload = payload.into_inner();
-    let channel = context_string(
-        payload.reply_to.as_ref(),
-        payload.metadata.as_ref(),
-        &["channel"],
-    );
-    if let Some(channel) = channel.as_deref() {
-        if !channel.eq_ignore_ascii_case("wechat") {
-            return Err(ServiceError::BadRequest(
-                "replyTo.channel 或 metadata.channel 必须为 wechat".to_string(),
-            ));
-        }
     }
 
     let session_key = payload.session_key.clone().or_else(|| {
@@ -141,18 +126,7 @@ async fn handle_channel_callback(
             .as_ref()
             .and_then(|value| value_string(value, &["sessionKey", "session_key", "key"]))
     });
-    let tenant_id = context_string(
-        payload.reply_to.as_ref(),
-        payload.metadata.as_ref(),
-        &["tenantId", "tenant_id"],
-    )
-    .or_else(|| {
-        payload
-            .session
-            .as_ref()
-            .and_then(|value| value_string(value, &["tenantId", "tenant_id"]))
-    })
-    .ok_or_else(|| {
+    let tenant_id = extract_callback_tenant_id(&payload).ok_or_else(|| {
         ServiceError::BadRequest(
             "replyTo.tenantId/metadata.tenantId/session.tenantId 缺失".to_string(),
         )
@@ -259,10 +233,68 @@ fn context_string(
         .or_else(|| secondary.and_then(|value| value_string(value, keys)))
 }
 
-fn is_callback_authorized(req: &HttpRequest, expected_token: Option<&str>) -> bool {
-    let Some(expected) = expected_token else {
+async fn resolve_callback_auth_tokens(
+    state: &Arc<AppState>,
+    tenant_id: Option<&str>,
+) -> Vec<String> {
+    let mut tokens = Vec::with_capacity(2);
+
+    if let Some(tenant_id) = tenant_id {
+        if let Some(tenant) = state.get_tenant(tenant_id) {
+            let credential = tenant.credential.read().await.clone();
+            if let Some(token) = credential.outbound_token.and_then(|value| {
+                let trimmed = value.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            }) {
+                tokens.push(token);
+            }
+        }
+    }
+
+    if let Some(token) = state
+        .config
+        .channel_gateway
+        .inbound_token
+        .clone()
+        .and_then(|value| {
+            let trimmed = value.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+    {
+        if !tokens.iter().any(|value| value == &token) {
+            tokens.push(token);
+        }
+    }
+
+    tokens
+}
+
+fn extract_callback_tenant_id(payload: &ChannelCallbackRequest) -> Option<String> {
+    context_string(
+        payload.reply_to.as_ref(),
+        payload.metadata.as_ref(),
+        &["tenantId", "tenant_id"],
+    )
+    .or_else(|| {
+        payload
+            .session
+            .as_ref()
+            .and_then(|value| value_string(value, &["tenantId", "tenant_id"]))
+    })
+}
+
+fn is_callback_authorized(req: &HttpRequest, expected_tokens: &[String]) -> bool {
+    if expected_tokens.is_empty() {
         return true;
-    };
+    }
 
     if let Some(actual) = req
         .headers()
@@ -270,7 +302,7 @@ fn is_callback_authorized(req: &HttpRequest, expected_token: Option<&str>) -> bo
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
     {
-        if actual == expected {
+        if expected_tokens.iter().any(|expected| actual == expected) {
             return true;
         }
     }
@@ -283,7 +315,7 @@ fn is_callback_authorized(req: &HttpRequest, expected_token: Option<&str>) -> bo
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)
     {
-        if actual == expected {
+        if expected_tokens.iter().any(|expected| actual == expected) {
             return true;
         }
     }

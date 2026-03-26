@@ -248,7 +248,13 @@ impl AppState {
         let tenants = self.tenant_store.list_tenants().await?;
         let mut loaded = 0usize;
         for item in tenants {
-            let context = Arc::new(TenantContext::new(item.tenant_id.clone(), item.credential));
+            let mut credential = item.credential;
+            if credential.ensure_outbound_token() {
+                self.tenant_store
+                    .upsert_tenant(&item.tenant_id, &credential)
+                    .await?;
+            }
+            let context = Arc::new(TenantContext::new(item.tenant_id.clone(), credential));
             self.tenants.insert(item.tenant_id, context);
             loaded += 1;
         }

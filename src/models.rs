@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantCredential {
@@ -18,6 +19,15 @@ pub struct TenantCredential {
     pub lowcode_ws_base_url: Option<String>,
     #[serde(rename = "gateway_token", default)]
     pub lowcode_ws_token: Option<String>,
+    #[serde(
+        rename = "outbound_token",
+        default,
+        alias = "outboundToken",
+        alias = "outboundCallbackToken",
+        alias = "callbackToken",
+        alias = "channelCallbackToken"
+    )]
+    pub outbound_token: Option<String>,
     #[serde(default)]
     pub lowcode_forward_enabled: Option<bool>,
     #[serde(default)]
@@ -35,6 +45,21 @@ impl TenantCredential {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .is_some()
+    }
+
+    pub fn ensure_outbound_token(&mut self) -> bool {
+        if self
+            .outbound_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+        {
+            return false;
+        }
+
+        self.outbound_token = Some(generate_outbound_token());
+        true
     }
 }
 
@@ -104,4 +129,8 @@ pub fn mask_secret(secret: &str) -> String {
     let prefix = &secret[..3];
     let suffix = &secret[secret.len() - 3..];
     format!("{prefix}******{suffix}")
+}
+
+pub fn generate_outbound_token() -> String {
+    format!("wechat_outbound_{}", Uuid::new_v4().simple())
 }

@@ -20,8 +20,6 @@ struct ChannelCallbackRequest {
     #[serde(default)]
     event_type: Option<String>,
     #[serde(default)]
-    channel: Option<String>,
-    #[serde(default)]
     session_key: Option<String>,
     #[serde(default)]
     request_id: Option<String>,
@@ -124,17 +122,15 @@ async fn handle_channel_callback(
     }
 
     let payload = payload.into_inner();
-    let channel = payload.channel.clone().or_else(|| {
-        context_string(
-            payload.reply_to.as_ref(),
-            payload.metadata.as_ref(),
-            &["channel"],
-        )
-    });
+    let channel = context_string(
+        payload.reply_to.as_ref(),
+        payload.metadata.as_ref(),
+        &["channel"],
+    );
     if let Some(channel) = channel.as_deref() {
         if !channel.eq_ignore_ascii_case("wechat") {
             return Err(ServiceError::BadRequest(
-                "channel/replyTo.channel/metadata.channel 必须为 wechat".to_string(),
+                "replyTo.channel 或 metadata.channel 必须为 wechat".to_string(),
             ));
         }
     }

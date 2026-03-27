@@ -431,7 +431,10 @@ impl AppState {
         auto_start: bool,
     ) -> Result<(), ServiceError> {
         tenant.prune_finished_login_worker().await;
-        self.stop_login_worker(&tenant).await;
+        let previous_handle = {
+            let mut guard = tenant.login_worker.lock().await;
+            guard.take()
+        };
 
         let now = Utc::now();
         tenant
@@ -447,6 +450,18 @@ impl AppState {
                 last_error: None,
             })
             .await;
+
+        if let Some(handle) = previous_handle {
+            let tenant_id = tenant.tenant_id.clone();
+            let _ = handle.stop_tx.send(true);
+            tokio::spawn(async move {
+                let _ = handle.join_handle.await;
+                info!(
+                    tenant_id = %tenant_id,
+                    "旧微信扫码后台轮询已后台回收"
+                );
+            });
+        }
 
         let (stop_tx, stop_rx) = watch::channel(false);
         let state_clone = self.clone();

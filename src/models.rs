@@ -114,6 +114,24 @@ pub struct SendTextMessageRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SendMediaMessageRequest {
+    #[serde(default, alias = "toUserId")]
+    pub to_user_id: Option<String>,
+    #[serde(default, alias = "contextToken")]
+    pub context_token: Option<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default, alias = "mediaUrl")]
+    pub media_url: Option<String>,
+    #[serde(default, alias = "mediaPath")]
+    pub media_path: Option<String>,
+    #[serde(default, alias = "fileName")]
+    pub file_name: Option<String>,
+    #[serde(default, alias = "mediaType")]
+    pub media_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct SendSessionMessageRequest {
     pub session_key: String,
     #[serde(default, alias = "contextToken")]

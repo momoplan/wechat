@@ -1,5 +1,5 @@
 use crate::error::ServiceError;
-use crate::models::SendTextMessageRequest;
+use crate::models::{SendMediaMessageRequest, SendTextMessageRequest};
 use crate::state::{AppState, TenantContext};
 use crate::wechat_api;
 use actix_web::{HttpResponse, Scope, web};
@@ -13,6 +13,7 @@ pub fn scope() -> Scope {
             web::post().to(send_message_by_session),
         )
         .route("/message/sendText", web::post().to(send_text_message))
+        .route("/message/sendMedia", web::post().to(send_media_message))
 }
 
 async fn send_message_by_session(
@@ -59,6 +60,34 @@ async fn send_text_message(
             ),
             context_token: optional_string(sdk_request, &["contextToken", "context_token"]),
             text: require_string(sdk_request, &["text"], "sdkRequest.text")?,
+        },
+    )
+    .await?;
+    Ok(HttpResponse::Ok().json(data))
+}
+
+async fn send_media_message(
+    payload: web::Json<Value>,
+    state: web::Data<Arc<AppState>>,
+) -> Result<HttpResponse, ServiceError> {
+    let payload = payload.into_inner();
+    let body = require_object(&payload, "请求体")?;
+    let tenant = resolve_tenant(&state, body).await?;
+    let sdk_request = sdk_request(body)?;
+    let data = wechat_api::send_media_message(
+        state.get_ref(),
+        &tenant,
+        SendMediaMessageRequest {
+            to_user_id: optional_string(
+                sdk_request,
+                &["toUserId", "to_user_id", "userId", "user_id"],
+            ),
+            context_token: optional_string(sdk_request, &["contextToken", "context_token"]),
+            text: optional_string(sdk_request, &["text"]),
+            media_url: optional_string(sdk_request, &["mediaUrl", "media_url", "url"]),
+            media_path: optional_string(sdk_request, &["mediaPath", "media_path", "path"]),
+            file_name: optional_string(sdk_request, &["fileName", "file_name"]),
+            media_type: optional_string(sdk_request, &["mediaType", "media_type"]),
         },
     )
     .await?;

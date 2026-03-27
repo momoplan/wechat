@@ -1,16 +1,23 @@
 use crate::error::ServiceError;
-use crate::models::{SendTextMessageRequest, TenantCredential};
+use crate::models::{SendMediaMessageRequest, SendTextMessageRequest, TenantCredential};
 use crate::state::{AppState, TenantContext};
+use aes::Aes128;
+use aes::cipher::{BlockEncryptMut, KeyInit, block_padding::Pkcs7};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use ecb::Encryptor;
+use hex::encode as hex_encode;
 use image::{DynamicImage, ImageFormat, Luma};
 use qrcode::QrCode;
 use rand::Rng as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
+
+type Aes128EcbEnc = Encryptor<Aes128>;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LoginQrResponse {
@@ -43,6 +50,58 @@ pub struct GetUpdatesResponse {
     pub msgs: Vec<Value>,
     #[serde(default, rename = "get_updates_buf")]
     pub get_updates_buf: Option<String>,
+}
+
+const DEFAULT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
+const CDN_UPLOAD_RETRIES: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MediaKind {
+    Image,
+    Video,
+    File,
+}
+
+impl MediaKind {
+    fn from_hint(value: Option<&str>) -> Option<Self> {
+        match value.map(str::trim).filter(|value| !value.is_empty())? {
+            value if value.eq_ignore_ascii_case("image") => Some(Self::Image),
+            value if value.eq_ignore_ascii_case("video") => Some(Self::Video),
+            value if value.eq_ignore_ascii_case("file") => Some(Self::File),
+            _ => None,
+        }
+    }
+
+    fn upload_media_type(self) -> i64 {
+        match self {
+            Self::Image => 1,
+            Self::Video => 2,
+            Self::File => 3,
+        }
+    }
+
+    fn message_item_type(self) -> i64 {
+        match self {
+            Self::Image => 2,
+            Self::Video => 5,
+            Self::File => 4,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MediaPayload {
+    bytes: Vec<u8>,
+    file_name: String,
+    media_kind: MediaKind,
+}
+
+#[derive(Debug)]
+struct UploadedMedia {
+    download_encrypted_query_param: String,
+    aes_key_hex: String,
+    plaintext_size: usize,
+    ciphertext_size: usize,
 }
 
 fn normalize_base_url(value: &str) -> String {
@@ -214,6 +273,416 @@ fn redact_sendmessage_payload(payload: &Value) -> Value {
         }
     }
     redacted
+}
+
+fn build_base_info() -> Value {
+    json!({
+        "channel_version": "0.1.0"
+    })
+}
+
+fn normalize_optional_text(value: Option<String>) -> Option<String> {
+    value
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+async fn resolve_context_token(
+    tenant: &Arc<TenantContext>,
+    user_id: &str,
+    context_token: Option<&str>,
+) -> Result<String, ServiceError> {
+    if let Some(value) = context_token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+    {
+        Ok(value)
+    } else if let Some(value) = tenant.get_context_token(user_id).await {
+        Ok(value)
+    } else {
+        Err(ServiceError::BadRequest(
+            "缺少 contextToken，无法回消息".to_string(),
+        ))
+    }
+}
+
+fn build_sendmessage_body(user_id: &str, context_token: &str, item_list: Vec<Value>) -> Value {
+    json!({
+        "msg": {
+            "from_user_id": "",
+            "to_user_id": user_id,
+            "client_id": format!("lowcode-wechat-{}", uuid::Uuid::new_v4()),
+            "message_type": 2,
+            "message_state": 2,
+            "item_list": item_list,
+            "context_token": context_token
+        },
+        "base_info": build_base_info()
+    })
+}
+
+async fn send_message_body(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    token: &str,
+    base_url: &str,
+    user_id: &str,
+    body: Value,
+) -> Result<Value, ServiceError> {
+    let endpoint = format!("{base_url}/ilink/bot/sendmessage");
+    let log_payload = redact_sendmessage_payload(&body);
+    info!(
+        tenant_id = %tenant.tenant_id,
+        user_id,
+        endpoint = %endpoint,
+        payload = %log_payload,
+        "调用微信 sendmessage 请求"
+    );
+
+    let mut request = state.http_client.post(&endpoint).json(&body);
+    for (key, value) in build_headers(token) {
+        request = request.header(key, value);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|err| ServiceError::Upstream(format!("发送微信消息失败: {err}")))?;
+    let status = response.status();
+    let raw_body = response
+        .text()
+        .await
+        .map_err(|err| ServiceError::Upstream(format!("读取微信响应失败: {err}")))?;
+    info!(
+        tenant_id = %tenant.tenant_id,
+        user_id,
+        endpoint = %endpoint,
+        status = %status,
+        response_body = %raw_body,
+        "微信 sendmessage 响应"
+    );
+
+    let body = if !status.is_success() {
+        return Err(ServiceError::Upstream(format!(
+            "sendmessage 返回 HTTP {}: {}",
+            status.as_u16(),
+            raw_body
+        )));
+    } else if raw_body.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str::<Value>(&raw_body).map_err(|err| {
+            ServiceError::Upstream(format!("解析微信响应 JSON 失败: {err}; body={raw_body}"))
+        })?
+    };
+    ensure_success(&body, "sendmessage")?;
+    Ok(body)
+}
+
+fn aes_ecb_padded_size(plaintext_size: usize) -> usize {
+    ((plaintext_size / 16) + 1) * 16
+}
+
+fn encrypt_aes_ecb(plaintext: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, ServiceError> {
+    let mut buffer = plaintext.to_vec();
+    let original_len = buffer.len();
+    buffer.resize(original_len + 16, 0);
+    let ciphertext = Aes128EcbEnc::new(key.into())
+        .encrypt_padded_mut::<Pkcs7>(&mut buffer, original_len)
+        .map_err(|err| ServiceError::Internal(format!("AES-128-ECB 加密失败: {err}")))?;
+    Ok(ciphertext.to_vec())
+}
+
+fn build_cdn_upload_url(upload_param: &str, filekey: &str) -> String {
+    format!(
+        "{DEFAULT_CDN_BASE_URL}/upload?encrypted_query_param={}&filekey={}",
+        urlencoding::encode(upload_param),
+        urlencoding::encode(filekey)
+    )
+}
+
+async fn get_upload_url(
+    state: &Arc<AppState>,
+    token: &str,
+    base_url: &str,
+    to_user_id: &str,
+    media_kind: MediaKind,
+    plaintext: &[u8],
+    filekey: &str,
+    aes_key_hex: &str,
+) -> Result<String, ServiceError> {
+    let endpoint = format!("{base_url}/ilink/bot/getuploadurl");
+    let body = json!({
+        "filekey": filekey,
+        "media_type": media_kind.upload_media_type(),
+        "to_user_id": to_user_id,
+        "rawsize": plaintext.len(),
+        "rawfilemd5": format!("{:x}", md5::compute(plaintext)),
+        "filesize": aes_ecb_padded_size(plaintext.len()),
+        "no_need_thumb": true,
+        "aeskey": aes_key_hex,
+        "base_info": build_base_info()
+    });
+
+    let mut request = state.http_client.post(&endpoint).json(&body);
+    for (key, value) in build_headers(token) {
+        request = request.header(key, value);
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|err| ServiceError::Upstream(format!("获取微信上传地址失败: {err}")))?;
+    let body = parse_api_json(response, "getuploadurl").await?;
+    ensure_success(&body, "getuploadurl")?;
+    body.get("upload_param")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| ServiceError::Upstream("getuploadurl 未返回 upload_param".to_string()))
+}
+
+async fn upload_media_to_cdn(
+    state: &Arc<AppState>,
+    plaintext: &[u8],
+    upload_param: &str,
+    filekey: &str,
+    aes_key: &[u8; 16],
+) -> Result<String, ServiceError> {
+    let ciphertext = encrypt_aes_ecb(plaintext, aes_key)?;
+    let endpoint = build_cdn_upload_url(upload_param, filekey);
+    let mut last_error: Option<String> = None;
+
+    for attempt in 1..=CDN_UPLOAD_RETRIES {
+        let response = state
+            .http_client
+            .post(&endpoint)
+            .header("Content-Type", "application/octet-stream")
+            .body(ciphertext.clone())
+            .send()
+            .await;
+
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                if let Some(value) = resp
+                    .headers()
+                    .get("x-encrypted-param")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    return Ok(value.to_string());
+                }
+                return Err(ServiceError::Upstream(
+                    "CDN 上传成功但缺少 x-encrypted-param".to_string(),
+                ));
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "(读取 CDN 响应失败)".to_string());
+                let message = format!("CDN 上传失败 HTTP {}: {}", status.as_u16(), body);
+                if status.is_client_error() {
+                    return Err(ServiceError::Upstream(message));
+                }
+                last_error = Some(message);
+            }
+            Err(err) => {
+                last_error = Some(format!("CDN 上传请求失败: {err}"));
+            }
+        }
+
+        if attempt < CDN_UPLOAD_RETRIES {
+            warn!(attempt, "CDN 上传失败，准备重试");
+        }
+    }
+
+    Err(ServiceError::Upstream(
+        last_error.unwrap_or_else(|| "CDN 上传失败".to_string()),
+    ))
+}
+
+fn infer_media_kind_from_name(name: &str) -> MediaKind {
+    match Path::new(name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp") => MediaKind::Image,
+        Some("mp4" | "mov" | "webm" | "mkv" | "avi") => MediaKind::Video,
+        _ => MediaKind::File,
+    }
+}
+
+fn infer_media_kind_from_content_type(value: Option<&str>) -> Option<MediaKind> {
+    let content_type = value?
+        .split(';')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    if content_type.starts_with("image/") {
+        Some(MediaKind::Image)
+    } else if content_type.starts_with("video/") {
+        Some(MediaKind::Video)
+    } else {
+        Some(MediaKind::File)
+    }
+}
+
+fn file_name_from_url(url: &reqwest::Url) -> Option<String> {
+    url.path_segments()
+        .and_then(|segments| segments.last())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+async fn load_media_payload(
+    state: &Arc<AppState>,
+    media_url: Option<&str>,
+    media_path: Option<&str>,
+    file_name: Option<&str>,
+    media_type: Option<&str>,
+) -> Result<MediaPayload, ServiceError> {
+    if let Some(url) = media_url.map(str::trim).filter(|value| !value.is_empty()) {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|err| ServiceError::BadRequest(format!("media_url 非法: {err}")))?;
+        let response = state
+            .http_client
+            .get(parsed.clone())
+            .send()
+            .await
+            .map_err(|err| ServiceError::Upstream(format!("下载媒体文件失败: {err}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "(读取下载响应失败)".to_string());
+            return Err(ServiceError::Upstream(format!(
+                "下载媒体文件失败 HTTP {}: {}",
+                status.as_u16(),
+                body
+            )));
+        }
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|err| ServiceError::Upstream(format!("读取媒体文件失败: {err}")))?;
+        let fallback_name = file_name
+            .map(ToString::to_string)
+            .or_else(|| file_name_from_url(&parsed))
+            .unwrap_or_else(|| "media.bin".to_string());
+        let kind = MediaKind::from_hint(media_type)
+            .or_else(|| infer_media_kind_from_content_type(content_type.as_deref()))
+            .unwrap_or_else(|| infer_media_kind_from_name(&fallback_name));
+        return Ok(MediaPayload {
+            bytes: bytes.to_vec(),
+            file_name: fallback_name,
+            media_kind: kind,
+        });
+    }
+
+    let Some(path_str) = media_path.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Err(ServiceError::BadRequest(
+            "media_url/media_path 不能同时为空".to_string(),
+        ));
+    };
+
+    let path = PathBuf::from(path_str);
+    let file_bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|err| ServiceError::BadRequest(format!("读取媒体文件失败: {err}")))?;
+    let fallback_name = file_name
+        .map(ToString::to_string)
+        .or_else(|| {
+            path.file_name()
+                .and_then(|value| value.to_str())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "media.bin".to_string());
+    let kind = MediaKind::from_hint(media_type)
+        .unwrap_or_else(|| infer_media_kind_from_name(&fallback_name));
+    Ok(MediaPayload {
+        bytes: file_bytes,
+        file_name: fallback_name,
+        media_kind: kind,
+    })
+}
+
+async fn upload_media(
+    state: &Arc<AppState>,
+    token: &str,
+    base_url: &str,
+    user_id: &str,
+    payload: &MediaPayload,
+) -> Result<UploadedMedia, ServiceError> {
+    let filekey = hex_encode(rand::rng().random::<[u8; 16]>());
+    let aes_key = rand::rng().random::<[u8; 16]>();
+    let aes_key_hex = hex_encode(aes_key);
+    let upload_param = get_upload_url(
+        state,
+        token,
+        base_url,
+        user_id,
+        payload.media_kind,
+        &payload.bytes,
+        &filekey,
+        &aes_key_hex,
+    )
+    .await?;
+    let download_encrypted_query_param =
+        upload_media_to_cdn(state, &payload.bytes, &upload_param, &filekey, &aes_key).await?;
+    Ok(UploadedMedia {
+        download_encrypted_query_param,
+        aes_key_hex,
+        plaintext_size: payload.bytes.len(),
+        ciphertext_size: aes_ecb_padded_size(payload.bytes.len()),
+    })
+}
+
+fn build_media_item(payload: &MediaPayload, uploaded: &UploadedMedia) -> Value {
+    let media = json!({
+        "encrypt_query_param": uploaded.download_encrypted_query_param,
+        "aes_key": BASE64_STANDARD.encode(hex::decode(&uploaded.aes_key_hex).unwrap_or_default()),
+        "encrypt_type": 1
+    });
+
+    match payload.media_kind {
+        MediaKind::Image => json!({
+            "type": payload.media_kind.message_item_type(),
+            "image_item": {
+                "media": media,
+                "mid_size": uploaded.ciphertext_size
+            }
+        }),
+        MediaKind::Video => json!({
+            "type": payload.media_kind.message_item_type(),
+            "video_item": {
+                "media": media,
+                "video_size": uploaded.ciphertext_size
+            }
+        }),
+        MediaKind::File => json!({
+            "type": payload.media_kind.message_item_type(),
+            "file_item": {
+                "media": media,
+                "file_name": payload.file_name,
+                "len": uploaded.plaintext_size.to_string()
+            }
+        }),
+    }
 }
 
 fn ensure_success(body: &Value, endpoint: &str) -> Result<(), ServiceError> {
@@ -475,6 +944,31 @@ pub async fn send_text_message(
     .await
 }
 
+pub async fn send_media_message(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    req: SendMediaMessageRequest,
+) -> Result<Value, ServiceError> {
+    let user_id = req
+        .to_user_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ServiceError::BadRequest("toUserId/to_user_id 不能为空".to_string()))?;
+    send_media_resource_to_user(
+        state,
+        tenant,
+        user_id,
+        normalize_optional_text(req.text),
+        req.media_url.as_deref(),
+        req.media_path.as_deref(),
+        req.context_token.as_deref(),
+        req.media_type.as_deref(),
+        req.file_name.as_deref(),
+    )
+    .await
+}
+
 pub async fn send_text_to_user(
     state: &Arc<AppState>,
     tenant: &Arc<TenantContext>,
@@ -498,85 +992,110 @@ pub async fn send_text_to_user(
             .as_deref()
             .unwrap_or(state.config.wechat.base_url.as_str()),
     );
-    let context_token = if let Some(value) = context_token
+    let context_token = resolve_context_token(tenant, user_id, context_token).await?;
+    let body = build_sendmessage_body(
+        user_id,
+        &context_token,
+        vec![json!({
+            "type": 1,
+            "text_item": {
+                "text": text
+            }
+        })],
+    );
+    send_message_body(state, tenant, token, &base_url, user_id, body).await
+}
+
+pub async fn send_media_to_user(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    user_id: &str,
+    text: Option<String>,
+    media_url: String,
+    context_token: Option<&str>,
+    media_type: Option<String>,
+    file_name: Option<String>,
+) -> Result<Value, ServiceError> {
+    send_media_resource_to_user(
+        state,
+        tenant,
+        user_id,
+        text,
+        Some(media_url.as_str()),
+        None,
+        context_token,
+        media_type.as_deref(),
+        file_name.as_deref(),
+    )
+    .await
+}
+
+async fn send_media_resource_to_user(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    user_id: &str,
+    text: Option<String>,
+    media_url: Option<&str>,
+    media_path: Option<&str>,
+    context_token: Option<&str>,
+    media_type: Option<&str>,
+    file_name: Option<&str>,
+) -> Result<Value, ServiceError> {
+    if media_url
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+        .is_none()
+        && media_path
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
     {
-        value
-    } else if let Some(value) = tenant.get_context_token(user_id).await {
-        value
-    } else {
         return Err(ServiceError::BadRequest(
-            "缺少 contextToken，无法回消息".to_string(),
+            "media_url/media_path 不能同时为空".to_string(),
         ));
-    };
+    }
 
-    let endpoint = format!("{base_url}/ilink/bot/sendmessage");
-    let body_str = json!({
-        "msg": {
-            "from_user_id": "",
-            "to_user_id": user_id,
-            "client_id": format!("lowcode-wechat-{}", uuid::Uuid::new_v4()),
-            "message_type": 2,
-            "message_state": 2,
-            "item_list": [{
+    let credential = tenant.credential.read().await.clone();
+    ensure_tenant_active(&credential)?;
+    let token = credential
+        .bot_token
+        .as_deref()
+        .ok_or_else(|| ServiceError::BadRequest("租户缺少 bot_token".to_string()))?;
+    let base_url = normalize_base_url(
+        credential
+            .api_base_url
+            .as_deref()
+            .unwrap_or(state.config.wechat.base_url.as_str()),
+    );
+    let context_token = resolve_context_token(tenant, user_id, context_token).await?;
+    let media_payload =
+        load_media_payload(state, media_url, media_path, file_name, media_type).await?;
+    let uploaded = upload_media(state, token, &base_url, user_id, &media_payload).await?;
+
+    let mut bodies = Vec::new();
+    if let Some(text) = text.filter(|value| !value.trim().is_empty()) {
+        bodies.push(build_sendmessage_body(
+            user_id,
+            &context_token,
+            vec![json!({
                 "type": 1,
                 "text_item": {
                     "text": text
                 }
-            }],
-            "context_token": context_token
-        },
-        "base_info": {
-            "channel_version": "0.1.0"
-        }
-    });
-
-    let log_payload = redact_sendmessage_payload(&body_str);
-    info!(
-        tenant_id = %tenant.tenant_id,
-        user_id,
-        endpoint = %endpoint,
-        payload = %log_payload,
-        "调用微信 sendmessage 请求"
-    );
-
-    let mut request = state.http_client.post(&endpoint).json(&body_str);
-    for (key, value) in build_headers(token) {
-        request = request.header(key, value);
+            })],
+        ));
     }
-
-    let response = request
-        .send()
-        .await
-        .map_err(|err| ServiceError::Upstream(format!("发送微信消息失败: {err}")))?;
-    let status = response.status();
-    let raw_body = response
-        .text()
-        .await
-        .map_err(|err| ServiceError::Upstream(format!("读取微信响应失败: {err}")))?;
-    info!(
-        tenant_id = %tenant.tenant_id,
+    bodies.push(build_sendmessage_body(
         user_id,
-        endpoint = %endpoint,
-        status = %status,
-        response_body = %raw_body,
-        "微信 sendmessage 响应"
-    );
-    let body = if !status.is_success() {
-        return Err(ServiceError::Upstream(format!(
-            "sendmessage 返回 HTTP {}: {}",
-            status.as_u16(),
-            raw_body
-        )));
-    } else {
-        serde_json::from_str::<Value>(&raw_body).map_err(|err| {
-            ServiceError::Upstream(format!("解析微信响应 JSON 失败: {err}; body={raw_body}"))
-        })?
-    };
-    ensure_success(&body, "sendmessage")?;
-    Ok(body)
+        &context_token,
+        vec![build_media_item(&media_payload, &uploaded)],
+    ));
+
+    let mut last = json!({});
+    for body in bodies {
+        last = send_message_body(state, tenant, token, &base_url, user_id, body).await?;
+    }
+    Ok(last)
 }
 
 pub async fn send_session_text(

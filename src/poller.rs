@@ -9,6 +9,7 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 const LOWCODE_FORWARD_FALLBACK_MESSAGE: &str = "消息暂时处理失败，请稍后重试或联系管理员。";
+const WECHAT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
 
 pub async fn run_tenant_poll_worker(
     state: Arc<AppState>,
@@ -164,7 +165,9 @@ async fn handle_inbound_message(state: &Arc<AppState>, tenant: &Arc<TenantContex
         .push_event(event, state.config.runtime.event_retention_per_tenant)
         .await;
 
-    if message_type != Some(1) {
+    let inbound_content = build_lowcode_inbound_content(&msg);
+    let has_media = has_media_items(&msg);
+    if message_type != Some(1) && !has_media {
         info!(
             tenant_id = %tenant.tenant_id,
             message_type = message_type_value,
@@ -177,13 +180,21 @@ async fn handle_inbound_message(state: &Arc<AppState>, tenant: &Arc<TenantContex
         warn!(tenant_id = %tenant.tenant_id, raw = %redacted_raw, "微信入站文本消息缺少 from_user_id，已记录但不转发");
         return;
     };
+    let Some(inbound_content) = inbound_content else {
+        info!(
+            tenant_id = %tenant.tenant_id,
+            message_type = message_type_value,
+            "微信入站消息未转发：未提取到可用内容"
+        );
+        return;
+    };
 
     maybe_forward_to_lowcode_agent(
         state,
         tenant,
         &msg,
         &from_user_id,
-        &content,
+        inbound_content,
         context_token.as_deref(),
     )
     .await;
@@ -236,12 +247,146 @@ fn extract_text(msg: &Value) -> String {
     }
 }
 
+fn has_media_items(msg: &Value) -> bool {
+    msg.get("item_list")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter().any(|item| {
+                matches!(
+                    item.get("type").and_then(Value::as_i64),
+                    Some(2) | Some(4) | Some(5)
+                )
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn build_lowcode_inbound_content(msg: &Value) -> Option<Value> {
+    let items = msg.get("item_list").and_then(Value::as_array)?;
+    let mut parts = Vec::new();
+    let mut has_text = false;
+    let mut has_media = false;
+
+    for item in items {
+        let item_type = item.get("type").and_then(Value::as_i64).unwrap_or_default();
+        match item_type {
+            1 => {
+                if let Some(text) = item
+                    .get("text_item")
+                    .and_then(|value| value.get("text"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    parts.push(json!({
+                        "type": "text",
+                        "text": text,
+                    }));
+                    has_text = true;
+                }
+            }
+            2 => {
+                parts.push(build_media_content_part(
+                    item,
+                    "input_image",
+                    "image_url",
+                    "image",
+                ));
+                has_media = true;
+            }
+            4 => {
+                parts.push(build_media_content_part(
+                    item,
+                    "input_file",
+                    "file_url",
+                    "file",
+                ));
+                has_media = true;
+            }
+            5 => {
+                parts.push(build_media_content_part(
+                    item,
+                    "input_video",
+                    "video_url",
+                    "video",
+                ));
+                has_media = true;
+            }
+            _ => {}
+        }
+    }
+
+    if has_media && !has_text {
+        let preview = extract_text(msg);
+        if !preview.trim().is_empty() && preview != "(empty message)" {
+            parts.insert(
+                0,
+                json!({
+                    "type": "text",
+                    "text": preview,
+                }),
+            );
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(Value::Array(parts))
+    }
+}
+
+fn build_media_content_part(
+    item: &Value,
+    part_type: &str,
+    url_key: &str,
+    media_kind: &str,
+) -> Value {
+    let detail_key = match media_kind {
+        "image" => "image_item",
+        "video" => "video_item",
+        "file" => "file_item",
+        _ => "media_item",
+    };
+    let detail = item.get(detail_key).cloned().unwrap_or(Value::Null);
+    let media = detail.get("media").cloned().unwrap_or(Value::Null);
+    let download_url = media
+        .get("encrypt_query_param")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(build_wechat_cdn_download_url);
+
+    let mut part = json!({
+        "type": part_type,
+        "source": "wechat",
+        "mediaType": media_kind,
+        "wechatMedia": detail,
+    });
+
+    if let Some(object) = part.as_object_mut() {
+        object.insert(
+            url_key.to_string(),
+            download_url.map(Value::String).unwrap_or(Value::Null),
+        );
+    }
+
+    part
+}
+
+fn build_wechat_cdn_download_url(encrypted_query_param: &str) -> String {
+    format!(
+        "{WECHAT_CDN_BASE_URL}/download?encrypted_query_param={}",
+        urlencoding::encode(encrypted_query_param)
+    )
+}
+
 async fn maybe_forward_to_lowcode_agent(
     state: &Arc<AppState>,
     tenant: &Arc<TenantContext>,
     raw_message: &Value,
     user_id: &str,
-    content: &str,
+    content: Value,
     context_token: Option<&str>,
 ) {
     let credential = tenant.credential.read().await.clone();
@@ -397,5 +542,90 @@ fn build_lowcode_inbound_endpoint(base_url: &str) -> String {
         trimmed.to_string()
     } else {
         format!("{trimmed}/inbound")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_lowcode_inbound_content, build_wechat_cdn_download_url, has_media_items};
+    use serde_json::json;
+
+    #[test]
+    fn builds_text_only_content_array() {
+        let msg = json!({
+            "item_list": [
+                {
+                    "type": 1,
+                    "text_item": {
+                        "text": "hello"
+                    }
+                }
+            ]
+        });
+
+        let content = build_lowcode_inbound_content(&msg).unwrap();
+        assert_eq!(
+            content,
+            json!([
+                {
+                    "type": "text",
+                    "text": "hello"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn builds_image_content_with_placeholder_text_and_cdn_url() {
+        let msg = json!({
+            "item_list": [
+                {
+                    "type": 2,
+                    "image_item": {
+                        "media": {
+                            "encrypt_query_param": "abc+/=",
+                            "aes_key": "key"
+                        },
+                        "mid_size": 12
+                    }
+                }
+            ]
+        });
+
+        let content = build_lowcode_inbound_content(&msg).unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "(image)");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(
+            content[1]["image_url"],
+            build_wechat_cdn_download_url("abc+/=")
+        );
+        assert_eq!(content[1]["wechatMedia"]["mid_size"], 12);
+    }
+
+    #[test]
+    fn builds_video_content_and_detects_media_items() {
+        let msg = json!({
+            "item_list": [
+                {
+                    "type": 5,
+                    "video_item": {
+                        "media": {
+                            "encrypt_query_param": "video-token"
+                        },
+                        "video_size": 1024
+                    }
+                }
+            ]
+        });
+
+        assert!(has_media_items(&msg));
+        let content = build_lowcode_inbound_content(&msg).unwrap();
+        assert_eq!(content[0]["text"], "(video)");
+        assert_eq!(content[1]["type"], "input_video");
+        assert_eq!(
+            content[1]["video_url"],
+            build_wechat_cdn_download_url("video-token")
+        );
     }
 }

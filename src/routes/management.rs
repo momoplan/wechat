@@ -6,6 +6,7 @@ use actix_web::{HttpResponse, Responder, Scope, web};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
+use tracing::{info, warn};
 
 #[derive(Debug, Deserialize)]
 struct EventQuery {
@@ -195,14 +196,26 @@ async fn create_login_qrcode(
     payload: web::Json<LoginQrRequest>,
 ) -> Result<HttpResponse, ServiceError> {
     let tenant_id = path.into_inner();
+    let request = payload.into_inner();
+    info!(
+        tenant_id = %tenant_id,
+        base_url_override = ?request.base_url,
+        "收到微信登录二维码申请"
+    );
     let tenant = state
         .get_tenant(&tenant_id)
         .ok_or_else(|| ServiceError::NotFound(format!("租户不存在: {tenant_id}")))?;
     let response =
-        wechat_api::fetch_login_qrcode(state.get_ref(), &tenant, payload.base_url.as_deref())
+        wechat_api::fetch_login_qrcode(state.get_ref(), &tenant, request.base_url.as_deref())
             .await?;
     let qr_image_data_url =
         wechat_api::normalize_login_qr_image_data_url(&response.qrcode_img_content)?;
+    info!(
+        tenant_id = %tenant_id,
+        qrcode = %wechat_api::mask_identifier(&response.qrcode),
+        ret = response.ret,
+        "微信登录二维码申请成功"
+    );
 
     Ok(HttpResponse::Ok().json(json!({
         "tenant_id": tenant_id,
@@ -224,6 +237,13 @@ async fn check_login_status(
         .get_tenant(&tenant_id)
         .ok_or_else(|| ServiceError::NotFound(format!("租户不存在: {tenant_id}")))?;
     let request = payload.into_inner();
+    info!(
+        tenant_id = %tenant_id,
+        qrcode = %wechat_api::mask_identifier(&request.qrcode),
+        auto_start = request.auto_start.unwrap_or(true),
+        base_url_override = ?request.base_url,
+        "收到微信扫码状态轮询请求"
+    );
     let response = wechat_api::poll_login_status(
         state.get_ref(),
         &existing,
@@ -231,6 +251,14 @@ async fn check_login_status(
         request.base_url.as_deref(),
     )
     .await?;
+    info!(
+        tenant_id = %tenant_id,
+        qrcode = %wechat_api::mask_identifier(&request.qrcode),
+        status = %response.status,
+        ilink_bot_id = ?response.ilink_bot_id,
+        ilink_user_id = ?response.ilink_user_id,
+        "微信扫码状态轮询完成"
+    );
 
     if response.status == "confirmed" {
         let bot_token = response
@@ -255,7 +283,31 @@ async fn check_login_status(
 
         let auto_start = request.auto_start.unwrap_or(true);
         if auto_start && tenant.credential.read().await.is_enabled() {
-            let _ = start_worker_internal(state.get_ref().clone(), tenant.clone()).await;
+            match start_worker_internal(state.get_ref().clone(), tenant.clone()).await {
+                Ok(()) => info!(
+                    tenant_id = %tenant_id,
+                    account_id = ?response.ilink_bot_id,
+                    user_id = ?response.ilink_user_id,
+                    auto_start,
+                    "微信扫码确认成功并已启动租户轮询"
+                ),
+                Err(err) => warn!(
+                    tenant_id = %tenant_id,
+                    account_id = ?response.ilink_bot_id,
+                    user_id = ?response.ilink_user_id,
+                    auto_start,
+                    error = %err,
+                    "微信扫码确认成功，但启动租户轮询失败"
+                ),
+            }
+        } else {
+            info!(
+                tenant_id = %tenant_id,
+                account_id = ?response.ilink_bot_id,
+                user_id = ?response.ilink_user_id,
+                auto_start,
+                "微信扫码确认成功并已写入租户凭据"
+            );
         }
 
         return Ok(HttpResponse::Ok().json(json!({

@@ -154,6 +154,29 @@ fn mask_token(value: &str) -> String {
     format!("{prefix}******{suffix}")
 }
 
+pub fn mask_identifier(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "(empty)".to_string();
+    }
+
+    let len = trimmed.chars().count();
+    if len <= 12 {
+        return mask_token(trimmed);
+    }
+
+    let prefix: String = trimmed.chars().take(4).collect();
+    let suffix: String = trimmed
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{prefix}******{suffix}")
+}
+
 fn redact_sendmessage_payload(payload: &Value) -> Value {
     let mut redacted = payload.clone();
     if let Some(value) = redacted.pointer_mut("/msg/context_token") {
@@ -203,6 +226,11 @@ pub async fn fetch_login_qrcode(
             .unwrap_or(state.config.wechat.base_url.as_str()),
     );
     let endpoint = format!("{base_url}/ilink/bot/get_bot_qrcode?bot_type=3");
+    info!(
+        tenant_id = %tenant.tenant_id,
+        endpoint = %endpoint,
+        "调用微信登录二维码接口"
+    );
 
     let body = parse_api_json(
         state
@@ -215,6 +243,20 @@ pub async fn fetch_login_qrcode(
     )
     .await?;
     ensure_success(&body, "get_bot_qrcode")?;
+    info!(
+        tenant_id = %tenant.tenant_id,
+        endpoint = %endpoint,
+        ret = body
+            .get("ret")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_default(),
+        qrcode = body
+            .get("qrcode")
+            .and_then(|value| value.as_str())
+            .map(mask_identifier)
+            .unwrap_or_else(|| "(missing)".to_string()),
+        "微信登录二维码接口返回成功"
+    );
 
     serde_json::from_value(body)
         .map_err(|err| ServiceError::Upstream(format!("解析二维码响应失败: {err}")))
@@ -268,6 +310,12 @@ pub async fn poll_login_status(
             .unwrap_or(state.config.wechat.base_url.as_str()),
     );
     let endpoint = format!("{base_url}/ilink/bot/get_qrcode_status");
+    info!(
+        tenant_id = %tenant.tenant_id,
+        endpoint = %endpoint,
+        qrcode = %mask_identifier(qrcode),
+        "调用微信扫码状态接口"
+    );
     let body = parse_api_json(
         state
             .http_client
@@ -279,6 +327,20 @@ pub async fn poll_login_status(
         "get_qrcode_status",
     )
     .await?;
+    info!(
+        tenant_id = %tenant.tenant_id,
+        endpoint = %endpoint,
+        qrcode = %mask_identifier(qrcode),
+        status = body
+            .get("status")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown"),
+        ilink_bot_id = body.get("ilink_bot_id").and_then(|value| value.as_str()),
+        ilink_user_id = body
+            .get("ilink_user_id")
+            .and_then(|value| value.as_str()),
+        "微信扫码状态接口返回"
+    );
 
     serde_json::from_value(body)
         .map_err(|err| ServiceError::Upstream(format!("解析扫码状态失败: {err}")))

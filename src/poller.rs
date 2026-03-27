@@ -110,12 +110,7 @@ async fn poll_and_handle(
 }
 
 async fn handle_inbound_message(state: &Arc<AppState>, tenant: &Arc<TenantContext>, msg: Value) {
-    let Some(message_type) = msg.get("message_type").and_then(Value::as_i64) else {
-        return;
-    };
-    if message_type != 1 {
-        return;
-    }
+    let message_type = msg.get("message_type").and_then(Value::as_i64);
 
     let from_user_id = msg
         .get("from_user_id")
@@ -123,9 +118,12 @@ async fn handle_inbound_message(state: &Arc<AppState>, tenant: &Arc<TenantContex
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
-    let Some(from_user_id) = from_user_id else {
-        return;
-    };
+    let to_user_id = msg
+        .get("to_user_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
 
     let context_token = msg
         .get("context_token")
@@ -133,20 +131,30 @@ async fn handle_inbound_message(state: &Arc<AppState>, tenant: &Arc<TenantContex
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
-    if let Some(token) = context_token.as_deref() {
+    if let (Some(from_user_id), Some(token)) = (from_user_id.as_deref(), context_token.as_deref()) {
         tenant.set_context_token(&from_user_id, token).await;
     }
 
     let content = extract_text(&msg);
+    let message_type_value = message_type.unwrap_or_default();
+    let redacted_raw = redact_inbound_message(&msg);
+    info!(
+        tenant_id = %tenant.tenant_id,
+        message_type = message_type,
+        from_user_id = ?from_user_id,
+        to_user_id = ?to_user_id,
+        context_token = context_token.as_deref().map(wechat_api::mask_identifier),
+        content = %content,
+        raw = %redacted_raw,
+        "收到微信入站消息"
+    );
+
     let event = ReceivedEvent {
         received_at: Utc::now(),
         event_type: "message".to_string(),
-        message_type: Some(message_type),
-        from_user_id: Some(from_user_id.clone()),
-        to_user_id: msg
-            .get("to_user_id")
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
+        message_type,
+        from_user_id: from_user_id.clone(),
+        to_user_id,
         content: Some(content.clone()),
         context_token: context_token.clone(),
         raw: msg.clone(),
@@ -155,6 +163,21 @@ async fn handle_inbound_message(state: &Arc<AppState>, tenant: &Arc<TenantContex
     tenant
         .push_event(event, state.config.runtime.event_retention_per_tenant)
         .await;
+
+    if message_type != Some(1) {
+        info!(
+            tenant_id = %tenant.tenant_id,
+            message_type = message_type_value,
+            "微信入站消息未转发：当前仅处理文本消息"
+        );
+        return;
+    }
+
+    let Some(from_user_id) = from_user_id else {
+        warn!(tenant_id = %tenant.tenant_id, raw = %redacted_raw, "微信入站文本消息缺少 from_user_id，已记录但不转发");
+        return;
+    };
+
     maybe_forward_to_lowcode_agent(
         state,
         tenant,
@@ -224,6 +247,11 @@ async fn maybe_forward_to_lowcode_agent(
     let credential = tenant.credential.read().await.clone();
     let forward_enabled = credential.lowcode_forward_enabled.unwrap_or(false);
     if !forward_enabled {
+        info!(
+            tenant_id = %tenant.tenant_id,
+            user_id,
+            "微信入站消息未转发：租户未启用 lowcode 转发"
+        );
         return;
     }
 
@@ -233,7 +261,11 @@ async fn maybe_forward_to_lowcode_agent(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        warn!(tenant_id = %tenant.tenant_id, "租户未配置 gateway_url，忽略转发");
+        warn!(
+            tenant_id = %tenant.tenant_id,
+            user_id,
+            "微信入站消息未转发：租户未配置 gateway_url"
+        );
         return;
     };
 
@@ -310,6 +342,16 @@ async fn maybe_forward_to_lowcode_agent(
             reply_lowcode_forward_failure(state, tenant, user_id, context_token, None).await;
         }
     }
+}
+
+fn redact_inbound_message(payload: &Value) -> Value {
+    let mut redacted = payload.clone();
+    if let Some(value) = redacted.pointer_mut("/context_token") {
+        if let Some(token) = value.as_str() {
+            *value = Value::String(wechat_api::mask_identifier(token));
+        }
+    }
+    redacted
 }
 
 async fn reply_lowcode_forward_failure(

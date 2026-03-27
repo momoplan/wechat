@@ -19,12 +19,15 @@ struct EventQuery {
 struct LoginQrRequest {
     #[serde(default, alias = "baseUrl")]
     base_url: Option<String>,
+    #[serde(default)]
+    auto_start: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct LoginStatusRequest {
-    qrcode: String,
+    #[serde(default)]
+    qrcode: Option<String>,
     #[serde(default, alias = "baseUrl")]
     base_url: Option<String>,
     #[serde(default)]
@@ -80,6 +83,7 @@ async fn get_tenant(
         .get_tenant(&tenant_id)
         .ok_or_else(|| ServiceError::NotFound(format!("租户不存在: {tenant_id}")))?;
     tenant.prune_finished_worker().await;
+    tenant.prune_finished_login_worker().await;
     Ok(HttpResponse::Ok().json(tenant.summary().await))
 }
 
@@ -94,6 +98,8 @@ async fn upsert_tenant(
 
     let (tenant, created) = state.upsert_tenant(&tenant_id, credential).await?;
     tenant.prune_finished_worker().await;
+    let _ = state.stop_login_worker(&tenant).await;
+    tenant.clear_login_session().await;
 
     let should_run = {
         let credential = tenant.credential.read().await.clone();
@@ -128,6 +134,7 @@ async fn delete_tenant(
         .remove_tenant(&tenant_id)
         .await?
         .ok_or_else(|| ServiceError::NotFound(format!("租户不存在: {tenant_id}")))?;
+    let _ = state.stop_login_worker(&tenant).await;
     stop_worker_internal(state.get_ref(), &tenant).await;
 
     Ok(HttpResponse::Ok().json(json!({
@@ -197,9 +204,11 @@ async fn create_login_qrcode(
 ) -> Result<HttpResponse, ServiceError> {
     let tenant_id = path.into_inner();
     let request = payload.into_inner();
+    let auto_start = request.auto_start.unwrap_or(true);
     info!(
         tenant_id = %tenant_id,
         base_url_override = ?request.base_url,
+        auto_start,
         "收到微信登录二维码申请"
     );
     let tenant = state
@@ -217,13 +226,44 @@ async fn create_login_qrcode(
         "微信登录二维码申请成功"
     );
 
+    let login_base_url = request
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            tenant
+                .credential
+                .try_read()
+                .ok()
+                .and_then(|credential| credential.api_base_url.clone())
+        })
+        .unwrap_or_else(|| state.config.wechat.base_url.clone());
+    state
+        .start_login_worker(
+            tenant.clone(),
+            response.qrcode.clone(),
+            login_base_url.clone(),
+            auto_start,
+        )
+        .await?;
+
     Ok(HttpResponse::Ok().json(json!({
         "tenant_id": tenant_id,
         "qrcode": response.qrcode,
         "url": response.qrcode_img_content,
         "login_url": response.qrcode_img_content,
         "qr_image_data_url": qr_image_data_url,
-        "ret": response.ret
+        "ret": response.ret,
+        "server_polling": true,
+        "auto_start": auto_start,
+        "login_status": {
+            "qrcode": response.qrcode,
+            "base_url": login_base_url,
+            "status": "pending",
+            "confirmed": false
+        }
     })))
 }
 
@@ -233,31 +273,105 @@ async fn check_login_status(
     payload: web::Json<LoginStatusRequest>,
 ) -> Result<HttpResponse, ServiceError> {
     let tenant_id = path.into_inner();
-    let existing = state
+    let tenant = state
         .get_tenant(&tenant_id)
         .ok_or_else(|| ServiceError::NotFound(format!("租户不存在: {tenant_id}")))?;
+    tenant.prune_finished_login_worker().await;
     let request = payload.into_inner();
+    let requested_qrcode = request.qrcode.clone().unwrap_or_default();
     info!(
         tenant_id = %tenant_id,
-        qrcode = %wechat_api::mask_identifier(&request.qrcode),
+        qrcode = %wechat_api::mask_identifier(&requested_qrcode),
         auto_start = request.auto_start.unwrap_or(true),
         base_url_override = ?request.base_url,
-        "收到微信扫码状态轮询请求"
+        "收到微信扫码状态查询请求"
     );
+
+    if let Some(session) = tenant.get_login_session().await {
+        let qrcode_matched =
+            requested_qrcode.trim().is_empty() || requested_qrcode == session.qrcode;
+        if qrcode_matched {
+            if let Some(auto_start) = request.auto_start {
+                let _ = tenant
+                    .update_login_session(&session.qrcode, |current| {
+                        current.auto_start = auto_start;
+                    })
+                    .await;
+            }
+            let current_session = tenant.get_login_session().await.unwrap_or(session);
+            info!(
+                tenant_id = %tenant_id,
+                qrcode = %wechat_api::mask_identifier(&current_session.qrcode),
+                status = %current_session.status,
+                confirmed = current_session.confirmed,
+                "返回服务端维护的微信扫码状态"
+            );
+            let mut body = json!({
+                "tenant_id": tenant_id,
+                "status": current_session.status,
+                "confirmed": current_session.confirmed,
+                "server_polling": true,
+                "qrcode": current_session.qrcode,
+                "base_url": current_session.base_url,
+                "auto_start": current_session.auto_start,
+                "updated_at": current_session.updated_at,
+                "completed_at": current_session.completed_at,
+                "last_error": current_session.last_error
+            });
+            if current_session.confirmed {
+                body["tenant"] = serde_json::to_value(tenant.summary().await)
+                    .map_err(|err| ServiceError::Internal(format!("序列化租户状态失败: {err}")))?;
+            }
+            return Ok(HttpResponse::Ok().json(body));
+        }
+
+        warn!(
+            tenant_id = %tenant_id,
+            requested_qrcode = %wechat_api::mask_identifier(&requested_qrcode),
+            tracked_qrcode = %wechat_api::mask_identifier(&session.qrcode),
+            "请求的二维码与服务端当前跟踪会话不一致，返回当前会话状态"
+        );
+
+        let mut body = json!({
+            "tenant_id": tenant_id,
+            "status": session.status,
+            "confirmed": session.confirmed,
+            "server_polling": true,
+            "requested_qrcode_matched": false,
+            "qrcode": session.qrcode,
+            "base_url": session.base_url,
+            "auto_start": session.auto_start,
+            "updated_at": session.updated_at,
+            "completed_at": session.completed_at,
+            "last_error": session.last_error
+        });
+        if session.confirmed {
+            body["tenant"] = serde_json::to_value(tenant.summary().await)
+                .map_err(|err| ServiceError::Internal(format!("序列化租户状态失败: {err}")))?;
+        }
+        return Ok(HttpResponse::Ok().json(body));
+    }
+
+    if requested_qrcode.trim().is_empty() {
+        return Err(ServiceError::BadRequest(
+            "当前没有服务端跟踪中的二维码，且请求缺少 qrcode".to_string(),
+        ));
+    }
+
     let response = wechat_api::poll_login_status(
         state.get_ref(),
-        &existing,
-        &request.qrcode,
+        &tenant,
+        &requested_qrcode,
         request.base_url.as_deref(),
     )
     .await?;
     info!(
         tenant_id = %tenant_id,
-        qrcode = %wechat_api::mask_identifier(&request.qrcode),
+        qrcode = %wechat_api::mask_identifier(&requested_qrcode),
         status = %response.status,
         ilink_bot_id = ?response.ilink_bot_id,
         ilink_user_id = ?response.ilink_user_id,
-        "微信扫码状态轮询完成"
+        "兼容模式微信扫码状态查询完成"
     );
 
     if response.status == "confirmed" {
@@ -280,6 +394,8 @@ async fn check_login_status(
                 response.ilink_user_id.as_deref(),
             )
             .await?;
+        let _ = state.stop_login_worker(&tenant).await;
+        tenant.clear_login_session().await;
 
         let auto_start = request.auto_start.unwrap_or(true);
         if auto_start && tenant.credential.read().await.is_enabled() {
@@ -289,7 +405,7 @@ async fn check_login_status(
                     account_id = ?response.ilink_bot_id,
                     user_id = ?response.ilink_user_id,
                     auto_start,
-                    "微信扫码确认成功并已启动租户轮询"
+                    "兼容模式微信扫码确认成功并已启动租户轮询"
                 ),
                 Err(err) => warn!(
                     tenant_id = %tenant_id,
@@ -297,23 +413,16 @@ async fn check_login_status(
                     user_id = ?response.ilink_user_id,
                     auto_start,
                     error = %err,
-                    "微信扫码确认成功，但启动租户轮询失败"
+                    "兼容模式微信扫码确认成功，但启动租户轮询失败"
                 ),
             }
-        } else {
-            info!(
-                tenant_id = %tenant_id,
-                account_id = ?response.ilink_bot_id,
-                user_id = ?response.ilink_user_id,
-                auto_start,
-                "微信扫码确认成功并已写入租户凭据"
-            );
         }
 
         return Ok(HttpResponse::Ok().json(json!({
             "tenant_id": tenant_id,
             "status": response.status,
             "confirmed": true,
+            "server_polling": false,
             "tenant": tenant.summary().await
         })));
     }
@@ -321,7 +430,8 @@ async fn check_login_status(
     Ok(HttpResponse::Ok().json(json!({
         "tenant_id": tenant_id,
         "status": response.status,
-        "confirmed": false
+        "confirmed": false,
+        "server_polling": false
     })))
 }
 

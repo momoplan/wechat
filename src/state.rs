@@ -5,21 +5,44 @@ use crate::models::{
 };
 use crate::poller;
 use crate::storage::TenantStore;
-use chrono::Utc;
+use crate::wechat_api;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock, watch};
+use tracing::{info, warn};
 
 pub struct PollWorkerHandle {
     pub stop_tx: watch::Sender<bool>,
     pub join_handle: tokio::task::JoinHandle<()>,
 }
 
+pub struct LoginPollHandle {
+    pub stop_tx: watch::Sender<bool>,
+    pub join_handle: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LoginSession {
+    pub qrcode: String,
+    pub base_url: String,
+    pub auto_start: bool,
+    pub status: String,
+    pub confirmed: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+}
+
 pub struct TenantContext {
     pub tenant_id: String,
     pub credential: RwLock<TenantCredential>,
     pub worker: Mutex<Option<PollWorkerHandle>>,
+    pub login_worker: Mutex<Option<LoginPollHandle>>,
+    pub login_session: RwLock<Option<LoginSession>>,
     pub events: Mutex<VecDeque<ReceivedEvent>>,
     pub latest_context_tokens: Mutex<HashMap<String, String>>,
     pub connection_status: RwLock<ConnectionStatus>,
@@ -32,6 +55,8 @@ impl TenantContext {
             tenant_id,
             credential: RwLock::new(credential),
             worker: Mutex::new(None),
+            login_worker: Mutex::new(None),
+            login_session: RwLock::new(None),
             events: Mutex::new(VecDeque::new()),
             latest_context_tokens: Mutex::new(HashMap::new()),
             connection_status: RwLock::new(ConnectionStatus {
@@ -199,6 +224,54 @@ impl TenantContext {
             self.refresh_runtime_flags().await;
         }
     }
+
+    pub async fn prune_finished_login_worker(&self) {
+        let finished = {
+            let guard = self.login_worker.lock().await;
+            guard
+                .as_ref()
+                .map(|handle| handle.join_handle.is_finished())
+                .unwrap_or(false)
+        };
+
+        if finished {
+            let handle_opt = {
+                let mut guard = self.login_worker.lock().await;
+                guard.take()
+            };
+            if let Some(handle) = handle_opt {
+                let _ = handle.join_handle.await;
+            }
+        }
+    }
+
+    pub async fn set_login_session(&self, session: LoginSession) {
+        let mut guard = self.login_session.write().await;
+        *guard = Some(session);
+    }
+
+    pub async fn get_login_session(&self) -> Option<LoginSession> {
+        self.login_session.read().await.clone()
+    }
+
+    pub async fn update_login_session<F>(&self, qrcode: &str, update: F) -> Option<LoginSession>
+    where
+        F: FnOnce(&mut LoginSession),
+    {
+        let mut guard = self.login_session.write().await;
+        let session = guard.as_mut()?;
+        if session.qrcode != qrcode {
+            return None;
+        }
+        update(session);
+        session.updated_at = Utc::now();
+        Some(session.clone())
+    }
+
+    pub async fn clear_login_session(&self) {
+        let mut guard = self.login_session.write().await;
+        *guard = None;
+    }
 }
 
 pub struct AppState {
@@ -350,6 +423,70 @@ impl AppState {
         Ok(tenant)
     }
 
+    pub async fn start_login_worker(
+        self: &Arc<Self>,
+        tenant: Arc<TenantContext>,
+        qrcode: String,
+        base_url: String,
+        auto_start: bool,
+    ) -> Result<(), ServiceError> {
+        tenant.prune_finished_login_worker().await;
+        self.stop_login_worker(&tenant).await;
+
+        let now = Utc::now();
+        tenant
+            .set_login_session(LoginSession {
+                qrcode: qrcode.clone(),
+                base_url: base_url.clone(),
+                auto_start,
+                status: "pending".to_string(),
+                confirmed: false,
+                created_at: now,
+                updated_at: now,
+                completed_at: None,
+                last_error: None,
+            })
+            .await;
+
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let state_clone = self.clone();
+        let tenant_clone = tenant.clone();
+        let qrcode_clone = qrcode.clone();
+        let join_handle = tokio::spawn(async move {
+            run_login_poll_worker(state_clone, tenant_clone, qrcode_clone, base_url, stop_rx).await;
+        });
+
+        let mut guard = tenant.login_worker.lock().await;
+        *guard = Some(LoginPollHandle {
+            stop_tx,
+            join_handle,
+        });
+        drop(guard);
+
+        info!(
+            tenant_id = %tenant.tenant_id,
+            qrcode = %wechat_api::mask_identifier(&qrcode),
+            auto_start,
+            "已启动微信扫码后台轮询"
+        );
+        Ok(())
+    }
+
+    pub async fn stop_login_worker(&self, tenant: &Arc<TenantContext>) -> bool {
+        let handle_opt = {
+            let mut guard = tenant.login_worker.lock().await;
+            guard.take()
+        };
+
+        if let Some(handle) = handle_opt {
+            let _ = handle.stop_tx.send(true);
+            let _ = handle.join_handle.await;
+            true
+        } else {
+            false
+        }
+    }
+
     pub async fn start_tenant_worker(
         self: &Arc<Self>,
         tenant: Arc<TenantContext>,
@@ -399,6 +536,226 @@ impl AppState {
             true
         } else {
             false
+        }
+    }
+}
+
+const LOGIN_POLL_TIMEOUT_SECS: u64 = 300;
+
+fn is_terminal_login_status(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_lowercase().as_str(),
+        "confirmed" | "expired" | "timeout" | "canceled" | "cancelled" | "rejected" | "failed"
+    )
+}
+
+async fn run_login_poll_worker(
+    state: Arc<AppState>,
+    tenant: Arc<TenantContext>,
+    qrcode: String,
+    base_url: String,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    let poll_interval = Duration::from_secs(state.config.runtime.poll_retry_seconds.max(1));
+    let deadline = Instant::now() + Duration::from_secs(LOGIN_POLL_TIMEOUT_SECS);
+
+    loop {
+        if *stop_rx.borrow() {
+            info!(
+                tenant_id = %tenant.tenant_id,
+                qrcode = %wechat_api::mask_identifier(&qrcode),
+                "微信扫码后台轮询已停止"
+            );
+            return;
+        }
+
+        match wechat_api::poll_login_status(&state, &tenant, &qrcode, Some(base_url.as_str())).await
+        {
+            Ok(response) => {
+                let status = response.status.clone();
+                let session = tenant
+                    .update_login_session(&qrcode, |session| {
+                        session.status = status.clone();
+                        session.last_error = None;
+                        if status == "confirmed" {
+                            session.confirmed = true;
+                            session.completed_at = Some(Utc::now());
+                        } else if is_terminal_login_status(&status) {
+                            session.completed_at = Some(Utc::now());
+                        }
+                    })
+                    .await;
+
+                let Some(session) = session else {
+                    info!(
+                        tenant_id = %tenant.tenant_id,
+                        qrcode = %wechat_api::mask_identifier(&qrcode),
+                        "微信扫码后台轮询发现会话已被替换，结束旧轮询"
+                    );
+                    return;
+                };
+
+                info!(
+                    tenant_id = %tenant.tenant_id,
+                    qrcode = %wechat_api::mask_identifier(&qrcode),
+                    status = %session.status,
+                    confirmed = session.confirmed,
+                    "微信扫码后台轮询状态已更新"
+                );
+
+                if status == "confirmed" {
+                    let bot_token = match response.bot_token.as_deref() {
+                        Some(value) if !value.trim().is_empty() => value,
+                        _ => {
+                            let err = "扫码确认成功但缺少 bot_token".to_string();
+                            warn!(
+                                tenant_id = %tenant.tenant_id,
+                                qrcode = %wechat_api::mask_identifier(&qrcode),
+                                error = %err,
+                                "微信扫码后台轮询确认失败"
+                            );
+                            let _ = tenant
+                                .update_login_session(&qrcode, |session| {
+                                    session.status = "error".to_string();
+                                    session.last_error = Some(err.clone());
+                                    session.completed_at = Some(Utc::now());
+                                })
+                                .await;
+                            return;
+                        }
+                    };
+
+                    let login_base_url = response.baseurl.as_deref().unwrap_or(base_url.as_str());
+                    match state
+                        .update_login_result(
+                            &tenant.tenant_id,
+                            bot_token,
+                            login_base_url,
+                            response.ilink_bot_id.as_deref(),
+                            response.ilink_user_id.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(updated_tenant) => {
+                            let auto_start = updated_tenant
+                                .get_login_session()
+                                .await
+                                .filter(|session| session.qrcode == qrcode)
+                                .map(|session| session.auto_start)
+                                .unwrap_or(true);
+                            if auto_start && updated_tenant.credential.read().await.is_enabled() {
+                                match state.start_tenant_worker(updated_tenant.clone()).await {
+                                    Ok(true) => info!(
+                                        tenant_id = %tenant.tenant_id,
+                                        account_id = ?response.ilink_bot_id,
+                                        user_id = ?response.ilink_user_id,
+                                        auto_start,
+                                        "微信扫码后台轮询确认成功并已启动租户轮询"
+                                    ),
+                                    Ok(false) => info!(
+                                        tenant_id = %tenant.tenant_id,
+                                        account_id = ?response.ilink_bot_id,
+                                        user_id = ?response.ilink_user_id,
+                                        auto_start,
+                                        "微信扫码后台轮询确认成功，租户轮询已在运行"
+                                    ),
+                                    Err(err) => warn!(
+                                        tenant_id = %tenant.tenant_id,
+                                        account_id = ?response.ilink_bot_id,
+                                        user_id = ?response.ilink_user_id,
+                                        auto_start,
+                                        error = %err,
+                                        "微信扫码后台轮询确认成功，但启动租户轮询失败"
+                                    ),
+                                }
+                            } else {
+                                info!(
+                                    tenant_id = %tenant.tenant_id,
+                                    account_id = ?response.ilink_bot_id,
+                                    user_id = ?response.ilink_user_id,
+                                    auto_start,
+                                    "微信扫码后台轮询确认成功并已写入租户凭据"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            warn!(
+                                tenant_id = %tenant.tenant_id,
+                                qrcode = %wechat_api::mask_identifier(&qrcode),
+                                error = %err,
+                                "微信扫码后台轮询写入租户凭据失败"
+                            );
+                            let _ = tenant
+                                .update_login_session(&qrcode, |session| {
+                                    session.status = "error".to_string();
+                                    session.last_error = Some(err.to_string());
+                                    session.completed_at = Some(Utc::now());
+                                })
+                                .await;
+                        }
+                    }
+                    return;
+                }
+
+                if is_terminal_login_status(&status) {
+                    info!(
+                        tenant_id = %tenant.tenant_id,
+                        qrcode = %wechat_api::mask_identifier(&qrcode),
+                        status = %status,
+                        "微信扫码后台轮询已结束"
+                    );
+                    return;
+                }
+            }
+            Err(err) => {
+                warn!(
+                    tenant_id = %tenant.tenant_id,
+                    qrcode = %wechat_api::mask_identifier(&qrcode),
+                    error = %err,
+                    "微信扫码后台轮询请求失败"
+                );
+                let _ = tenant
+                    .update_login_session(&qrcode, |session| {
+                        session.last_error = Some(err.to_string());
+                    })
+                    .await;
+            }
+        }
+
+        if Instant::now() >= deadline {
+            let _ = tenant
+                .update_login_session(&qrcode, |session| {
+                    session.status = "timeout".to_string();
+                    session.last_error = Some(format!(
+                        "二维码状态轮询超过 {} 秒仍未完成",
+                        LOGIN_POLL_TIMEOUT_SECS
+                    ));
+                    session.completed_at = Some(Utc::now());
+                })
+                .await;
+            warn!(
+                tenant_id = %tenant.tenant_id,
+                qrcode = %wechat_api::mask_identifier(&qrcode),
+                timeout_seconds = LOGIN_POLL_TIMEOUT_SECS,
+                "微信扫码后台轮询超时"
+            );
+            return;
+        }
+
+        let sleep = tokio::time::sleep(poll_interval);
+        tokio::pin!(sleep);
+        tokio::select! {
+            _ = &mut sleep => {}
+            changed = stop_rx.changed() => {
+                if changed.is_ok() && *stop_rx.borrow() {
+                    info!(
+                        tenant_id = %tenant.tenant_id,
+                        qrcode = %wechat_api::mask_identifier(&qrcode),
+                        "微信扫码后台轮询收到停止信号"
+                    );
+                    return;
+                }
+            }
         }
     }
 }

@@ -59,6 +59,35 @@ fn random_wechat_uin() -> String {
     BASE64_STANDARD.encode(value)
 }
 
+pub fn classify_login_qr_content(value: &str) -> &'static str {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "empty";
+    }
+    if trimmed.starts_with("data:image/") {
+        return "data_url";
+    }
+    if looks_like_base64(trimmed) {
+        return "base64";
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return "url";
+    }
+    "unknown"
+}
+
+pub fn preview_login_qr_content(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "(empty)".to_string();
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return trimmed.chars().take(120).collect();
+    }
+    let prefix: String = trimmed.chars().take(24).collect();
+    format!("{prefix}...")
+}
+
 pub fn normalize_login_qr_image_data_url(value: &str) -> Result<String, ServiceError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -258,13 +287,25 @@ pub async fn fetch_login_qrcode(
         "微信登录二维码接口返回成功"
     );
 
-    serde_json::from_value(body)
-        .map_err(|err| ServiceError::Upstream(format!("解析二维码响应失败: {err}")))
+    let response: LoginQrResponse = serde_json::from_value(body)
+        .map_err(|err| ServiceError::Upstream(format!("解析二维码响应失败: {err}")))?;
+    info!(
+        tenant_id = %tenant.tenant_id,
+        qrcode = %mask_identifier(&response.qrcode),
+        qrcode_img_content_format = classify_login_qr_content(&response.qrcode_img_content),
+        qrcode_img_content_len = response.qrcode_img_content.len(),
+        qrcode_img_content_preview = %preview_login_qr_content(&response.qrcode_img_content),
+        "微信登录二维码内容格式"
+    );
+
+    Ok(response)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_login_qr_image_data_url;
+    use super::{
+        classify_login_qr_content, normalize_login_qr_image_data_url, preview_login_qr_content,
+    };
 
     #[test]
     fn keeps_existing_data_url() {
@@ -288,6 +329,28 @@ mod tests {
         .expect("normalize login url");
         assert!(normalized.starts_with("data:image/png;base64,"));
         assert!(normalized.len() > "data:image/png;base64,".len());
+    }
+
+    #[test]
+    fn classifies_login_qr_content_types() {
+        assert_eq!(
+            classify_login_qr_content("data:image/png;base64,abc123"),
+            "data_url"
+        );
+        assert_eq!(classify_login_qr_content("YWJjZA=="), "base64");
+        assert_eq!(
+            classify_login_qr_content("https://liteapp.weixin.qq.com/q/test"),
+            "url"
+        );
+        assert_eq!(classify_login_qr_content(""), "empty");
+    }
+
+    #[test]
+    fn previews_non_url_qr_content_without_full_payload() {
+        assert_eq!(
+            preview_login_qr_content("data:image/png;base64,abcdefghijklmnopqrstuvwxyz"),
+            "data:image/png;base64,ab..."
+        );
     }
 }
 

@@ -205,13 +205,6 @@ async fn handle_channel_callback(
     let tenant = get_tenant(state.get_ref(), &tenant_id)?;
     match delivery {
         OutboundDelivery::Text(text) => {
-            let text = if let Some(bind_url) = extract_bind_url(&payload.data) {
-                let bind_prompt =
-                    extract_bind_prompt(&payload.data).unwrap_or_else(|| text.clone());
-                format!("{bind_prompt}\n{bind_url}")
-            } else {
-                text
-            };
             let text = truncate_text(text, 1800);
 
             wechat_api::send_text_to_user(
@@ -628,29 +621,6 @@ fn optional_file_name(map: &serde_json::Map<String, Value>) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn extract_bind_url(data: &Value) -> Option<String> {
-    data.pointer("/error/bindUrl")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-}
-
-fn extract_bind_prompt(data: &Value) -> Option<String> {
-    data.pointer("/error/displayMessage")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| {
-            data.pointer("/error/message")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToString::to_string)
-        })
-}
-
 fn extract_text_content(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => normalize_text(text),
@@ -762,6 +732,28 @@ mod tests {
         assert_eq!(
             extract_reply_delivery(&data),
             Some(OutboundDelivery::Text("最终结果".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_reply_delivery_reads_agent_error_content() {
+        let data = json!({
+            "type": "agent-error",
+            "content": [
+                {"type": "text", "text": "读取个人飞书文档前需要先授权。"},
+                {"type": "text", "text": "授权链接：https://example.com/oauth"}
+            ],
+            "error": {
+                "code": "USER_NOT_BOUND"
+            }
+        });
+
+        assert_eq!(
+            extract_reply_delivery(&data),
+            Some(OutboundDelivery::Text(
+                "读取个人飞书文档前需要先授权。\n\n授权链接：https://example.com/oauth"
+                    .to_string()
+            ))
         );
     }
 

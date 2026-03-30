@@ -188,7 +188,7 @@ curl -X POST http://127.0.0.1:3210/outbound \
     "eventType":"agentMessage",
     "session":{"scope":"dm","userId":"user_xxx","sessionKey":"wechat:dm:user_xxx"},
     "replyTo":{"channel":"wechat","tenantId":"demo","userId":"user_xxx","contextToken":"ctx_xxx"},
-    "data":{"content":{"text":"hello"}}
+    "data":{"content":[{"type":"text","text":"hello"}]}
   }'
 ```
 

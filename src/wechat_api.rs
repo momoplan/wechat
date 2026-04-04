@@ -58,6 +58,7 @@ const CDN_UPLOAD_RETRIES: usize = 3;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MediaKind {
     Image,
+    Audio,
     Video,
     File,
 }
@@ -66,6 +67,9 @@ impl MediaKind {
     fn from_hint(value: Option<&str>) -> Option<Self> {
         match value.map(str::trim).filter(|value| !value.is_empty())? {
             value if value.eq_ignore_ascii_case("image") => Some(Self::Image),
+            value if value.eq_ignore_ascii_case("audio") || value.eq_ignore_ascii_case("voice") => {
+                Some(Self::Audio)
+            }
             value if value.eq_ignore_ascii_case("video") => Some(Self::Video),
             value if value.eq_ignore_ascii_case("file") => Some(Self::File),
             _ => None,
@@ -75,6 +79,7 @@ impl MediaKind {
     fn upload_media_type(self) -> i64 {
         match self {
             Self::Image => 1,
+            Self::Audio => 3,
             Self::Video => 2,
             Self::File => 3,
         }
@@ -83,6 +88,7 @@ impl MediaKind {
     fn message_item_type(self) -> i64 {
         match self {
             Self::Image => 2,
+            Self::Audio => 3,
             Self::Video => 5,
             Self::File => 4,
         }
@@ -514,6 +520,9 @@ fn infer_media_kind_from_name(name: &str) -> MediaKind {
         .as_deref()
     {
         Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp") => MediaKind::Image,
+        Some("amr" | "wav" | "mp3" | "m4a" | "aac" | "ogg" | "opus" | "silk") => {
+            MediaKind::Audio
+        }
         Some("mp4" | "mov" | "webm" | "mkv" | "avi") => MediaKind::Video,
         _ => MediaKind::File,
     }
@@ -527,6 +536,8 @@ fn infer_media_kind_from_content_type(value: Option<&str>) -> Option<MediaKind> 
         .filter(|value| !value.is_empty())?;
     if content_type.starts_with("image/") {
         Some(MediaKind::Image)
+    } else if content_type.starts_with("audio/") {
+        Some(MediaKind::Audio)
     } else if content_type.starts_with("video/") {
         Some(MediaKind::Video)
     } else {
@@ -667,6 +678,12 @@ fn build_media_item(payload: &MediaPayload, uploaded: &UploadedMedia) -> Value {
                 "mid_size": uploaded.ciphertext_size
             }
         }),
+        MediaKind::Audio => json!({
+            "type": payload.media_kind.message_item_type(),
+            "voice_item": {
+                "media": media
+            }
+        }),
         MediaKind::Video => json!({
             "type": payload.media_kind.message_item_type(),
             "video_item": {
@@ -773,8 +790,11 @@ pub async fn fetch_login_qrcode(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_login_qr_content, normalize_login_qr_image_data_url, preview_login_qr_content,
+        MediaKind, MediaPayload, UploadedMedia, build_media_item, classify_login_qr_content,
+        infer_media_kind_from_content_type, infer_media_kind_from_name,
+        normalize_login_qr_image_data_url, preview_login_qr_content,
     };
+    use serde_json::json;
 
     #[test]
     fn keeps_existing_data_url() {
@@ -819,6 +839,44 @@ mod tests {
         assert_eq!(
             preview_login_qr_content("data:image/png;base64,abcdefghijklmnopqrstuvwxyz"),
             "data:image/png;base64,ab..."
+        );
+    }
+
+    #[test]
+    fn infers_audio_media_kind_from_content_type_and_name() {
+        assert_eq!(
+            infer_media_kind_from_content_type(Some("audio/wav")),
+            Some(MediaKind::Audio)
+        );
+        assert_eq!(infer_media_kind_from_name("voice.amr"), MediaKind::Audio);
+    }
+
+    #[test]
+    fn builds_voice_item_for_audio_payload() {
+        let payload = MediaPayload {
+            bytes: vec![1, 2, 3],
+            file_name: "voice.amr".to_string(),
+            media_kind: MediaKind::Audio,
+        };
+        let uploaded = UploadedMedia {
+            download_encrypted_query_param: "voice-token".to_string(),
+            aes_key_hex: "00112233445566778899aabbccddeeff".to_string(),
+            plaintext_size: 3,
+            ciphertext_size: 16,
+        };
+
+        assert_eq!(
+            build_media_item(&payload, &uploaded),
+            json!({
+                "type": 3,
+                "voice_item": {
+                    "media": {
+                        "encrypt_query_param": "voice-token",
+                        "aes_key": "ABEiM0RVZneImaq7zN3u/w==",
+                        "encrypt_type": 1
+                    }
+                }
+            })
         );
     }
 }

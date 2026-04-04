@@ -532,6 +532,10 @@ fn extract_media_candidate(value: &Value) -> Option<(String, Option<String>, Opt
     let direct = [
         ("imageUrl", Some("image")),
         ("image_url", Some("image")),
+        ("audioUrl", Some("audio")),
+        ("audio_url", Some("audio")),
+        ("voiceUrl", Some("audio")),
+        ("voice_url", Some("audio")),
         ("videoUrl", Some("video")),
         ("video_url", Some("video")),
         ("fileUrl", Some("file")),
@@ -556,6 +560,8 @@ fn extract_media_candidate(value: &Value) -> Option<(String, Option<String>, Opt
 
     for (key, kind) in [
         ("image_url", Some("image")),
+        ("audio_url", Some("audio")),
+        ("voice_url", Some("audio")),
         ("video_url", Some("video")),
         ("file_url", Some("file")),
     ] {
@@ -580,6 +586,10 @@ fn extract_media_candidate(value: &Value) -> Option<(String, Option<String>, Opt
     let item_type = map.get("type").and_then(Value::as_str).unwrap_or("");
     if (item_type.eq_ignore_ascii_case("image_url")
         || item_type.eq_ignore_ascii_case("input_image")
+        || item_type.eq_ignore_ascii_case("audio_url")
+        || item_type.eq_ignore_ascii_case("input_audio")
+        || item_type.eq_ignore_ascii_case("voice_url")
+        || item_type.eq_ignore_ascii_case("input_voice")
         || item_type.eq_ignore_ascii_case("video_url")
         || item_type.eq_ignore_ascii_case("file_url"))
         && let Some(url) = map
@@ -590,6 +600,8 @@ fn extract_media_candidate(value: &Value) -> Option<(String, Option<String>, Opt
     {
         let media_type = if item_type.contains("image") {
             Some("image".to_string())
+        } else if item_type.contains("audio") || item_type.contains("voice") {
+            Some("audio".to_string())
         } else if item_type.contains("video") {
             Some("video".to_string())
         } else if item_type.contains("file") {
@@ -793,6 +805,48 @@ mod tests {
                 text: Some("图片如下".to_string()),
                 media_url: "https://example.com/a.png".to_string(),
                 media_type: Some("image".to_string()),
+                file_name: None,
+            })
+        );
+    }
+
+    #[test]
+    fn extract_reply_delivery_extracts_audio_payload() {
+        let data = json!({
+            "type": "agentMessage",
+            "content": {
+                "audioUrl": "https://example.com/a.wav",
+                "text": "语音回复"
+            }
+        });
+
+        assert_eq!(
+            extract_reply_delivery(&data),
+            Some(OutboundDelivery::Media {
+                text: Some("语音回复".to_string()),
+                media_url: "https://example.com/a.wav".to_string(),
+                media_type: Some("audio".to_string()),
+                file_name: None,
+            })
+        );
+    }
+
+    #[test]
+    fn extract_reply_delivery_extracts_voice_item_from_array() {
+        let data = json!({
+            "type": "agentMessage",
+            "content": [
+                {"type": "text", "text": "请听语音"},
+                {"type": "input_voice", "url": "https://example.com/a.amr"}
+            ]
+        });
+
+        assert_eq!(
+            extract_reply_delivery(&data),
+            Some(OutboundDelivery::Media {
+                text: Some("请听语音".to_string()),
+                media_url: "https://example.com/a.amr".to_string(),
+                media_type: Some("audio".to_string()),
                 file_name: None,
             })
         );

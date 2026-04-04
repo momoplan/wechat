@@ -254,7 +254,7 @@ fn has_media_items(msg: &Value) -> bool {
             items.iter().any(|item| {
                 matches!(
                     item.get("type").and_then(Value::as_i64),
-                    Some(2) | Some(4) | Some(5)
+                    Some(2) | Some(3) | Some(4) | Some(5)
                 )
             })
         })
@@ -291,6 +291,15 @@ fn build_lowcode_inbound_content(msg: &Value) -> Option<Value> {
                     "input_image",
                     "image_url",
                     "image",
+                ));
+                has_media = true;
+            }
+            3 => {
+                parts.push(build_media_content_part(
+                    item,
+                    "input_file",
+                    "file_url",
+                    "audio",
                 ));
                 has_media = true;
             }
@@ -344,6 +353,7 @@ fn build_media_content_part(
 ) -> Value {
     let detail_key = match media_kind {
         "image" => "image_item",
+        "audio" => "voice_item",
         "video" => "video_item",
         "file" => "file_item",
         _ => "media_item",
@@ -627,5 +637,36 @@ mod tests {
             content[1]["video_url"],
             build_wechat_cdn_download_url("video-token")
         );
+    }
+
+    #[test]
+    fn builds_voice_content_with_transcript_and_audio_file() {
+        let msg = json!({
+            "item_list": [
+                {
+                    "type": 3,
+                    "voice_item": {
+                        "text": "帮我再装一个小象萨斯",
+                        "playtime": 3760,
+                        "media": {
+                            "encrypt_query_param": "voice-token",
+                            "aes_key": "key"
+                        }
+                    }
+                }
+            ]
+        });
+
+        assert!(has_media_items(&msg));
+        let content = build_lowcode_inbound_content(&msg).unwrap();
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "帮我再装一个小象萨斯");
+        assert_eq!(content[1]["type"], "input_file");
+        assert_eq!(content[1]["mediaType"], "audio");
+        assert_eq!(
+            content[1]["file_url"],
+            build_wechat_cdn_download_url("voice-token")
+        );
+        assert_eq!(content[1]["wechatMedia"]["playtime"], 3760);
     }
 }

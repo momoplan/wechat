@@ -7,6 +7,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+const MAX_WECHAT_TEXT_CHARS: usize = 1800;
+const MAX_WECHAT_CHUNK_LABEL_CHARS: usize = 16;
+
 #[derive(Debug, Deserialize)]
 struct TenantPath {
     tenant_id: String,
@@ -205,9 +208,7 @@ async fn handle_channel_callback(
     let tenant = get_tenant(state.get_ref(), &tenant_id)?;
     match delivery {
         OutboundDelivery::Text(text) => {
-            let text = truncate_text(text, 1800);
-
-            wechat_api::send_text_to_user(
+            send_text_chunks(
                 state.get_ref(),
                 &tenant,
                 &user_id,
@@ -222,11 +223,21 @@ async fn handle_channel_callback(
             media_type,
             file_name,
         } => {
+            if let Some(text) = text {
+                send_text_chunks(
+                    state.get_ref(),
+                    &tenant,
+                    &user_id,
+                    &text,
+                    context_token.as_deref(),
+                )
+                .await?;
+            }
             wechat_api::send_media_to_user(
                 state.get_ref(),
                 &tenant,
                 &user_id,
-                text.map(|value| truncate_text(value, 1800)),
+                None,
                 media_url,
                 context_token.as_deref(),
                 media_type,
@@ -662,17 +673,104 @@ fn normalize_text(text: &str) -> Option<String> {
     }
 }
 
-fn truncate_text(text: String, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        text
-    } else {
-        text.chars().take(limit).collect()
+async fn send_text_chunks(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    user_id: &str,
+    text: &str,
+    context_token: Option<&str>,
+) -> Result<(), ServiceError> {
+    for chunk in split_text_chunks(text, MAX_WECHAT_TEXT_CHARS) {
+        wechat_api::send_text_to_user(state, tenant, user_id, &chunk, context_token).await?;
+    }
+    Ok(())
+}
+
+fn split_text_chunks(text: &str, limit: usize) -> Vec<String> {
+    if limit <= MAX_WECHAT_CHUNK_LABEL_CHARS {
+        return split_text_chunks_raw(text, limit);
+    }
+
+    let reserve = MAX_WECHAT_CHUNK_LABEL_CHARS.min(limit.saturating_sub(1));
+    let content_limit = limit - reserve;
+    let raw_chunks = split_text_chunks_raw(text, content_limit);
+    if raw_chunks.len() <= 1 {
+        return raw_chunks;
+    }
+
+    let total = raw_chunks.len();
+    raw_chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| format!("（{}/{}）\n{}", index + 1, total, chunk))
+        .collect()
+}
+
+fn split_text_chunks_raw(text: &str, limit: usize) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0;
+
+    for segment in trimmed.split_inclusive('\n') {
+        let segment_len = segment.chars().count();
+        if segment_len > limit {
+            flush_chunk(&mut chunks, &mut current, &mut current_len);
+            split_long_segment(segment, limit, &mut chunks);
+            continue;
+        }
+
+        if current_len + segment_len > limit {
+            flush_chunk(&mut chunks, &mut current, &mut current_len);
+        }
+
+        current.push_str(segment);
+        current_len += segment_len;
+    }
+
+    flush_chunk(&mut chunks, &mut current, &mut current_len);
+    chunks
+}
+
+fn flush_chunk(chunks: &mut Vec<String>, current: &mut String, current_len: &mut usize) {
+    let normalized = current.trim_end_matches('\n').trim();
+    if !normalized.is_empty() {
+        chunks.push(normalized.to_string());
+    }
+    current.clear();
+    *current_len = 0;
+}
+
+fn split_long_segment(segment: &str, limit: usize, chunks: &mut Vec<String>) {
+    let mut current = String::new();
+    let mut current_len = 0;
+
+    for ch in segment.chars() {
+        if current_len >= limit {
+            let normalized = current.trim_end_matches('\n').trim();
+            if !normalized.is_empty() {
+                chunks.push(normalized.to_string());
+            }
+            current.clear();
+            current_len = 0;
+        }
+        current.push(ch);
+        current_len += 1;
+    }
+
+    let normalized = current.trim_end_matches('\n').trim();
+    if !normalized.is_empty() {
+        chunks.push(normalized.to_string());
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{OutboundDelivery, extract_reply_delivery};
+    use super::{OutboundDelivery, extract_reply_delivery, split_text_chunks};
     use serde_json::json;
 
     #[test]
@@ -763,8 +861,7 @@ mod tests {
         assert_eq!(
             extract_reply_delivery(&data),
             Some(OutboundDelivery::Text(
-                "读取个人飞书文档前需要先授权。\n\n授权链接：https://example.com/oauth"
-                    .to_string()
+                "读取个人飞书文档前需要先授权。\n\n授权链接：https://example.com/oauth".to_string()
             ))
         );
     }
@@ -850,5 +947,36 @@ mod tests {
                 file_name: None,
             })
         );
+    }
+
+    #[test]
+    fn split_text_chunks_keeps_short_text_as_single_message() {
+        assert_eq!(
+            split_text_chunks("hello\nworld", 1800),
+            vec!["hello\nworld".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_text_chunks_prefers_newline_boundaries() {
+        let text = format!("{}\n\n{}", "a".repeat(1200), "b".repeat(1200));
+        let chunks = split_text_chunks(&text, 1800);
+
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 1800));
+        assert_eq!(chunks[0], format!("（1/2）\n{}", "a".repeat(1200)));
+        assert_eq!(chunks[1], format!("（2/2）\n{}", "b".repeat(1200)));
+    }
+
+    #[test]
+    fn split_text_chunks_splits_single_oversized_line() {
+        let text = "x".repeat(3800);
+        let chunks = split_text_chunks(&text, 1800);
+
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 1800));
+        assert!(chunks[0].starts_with("（1/3）\n"));
+        assert!(chunks[1].starts_with("（2/3）\n"));
+        assert!(chunks[2].starts_with("（3/3）\n"));
     }
 }

@@ -1,6 +1,8 @@
 use crate::models::ReceivedEvent;
 use crate::state::{AppState, TenantContext};
 use crate::wechat_api;
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::Utc;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -188,6 +190,7 @@ async fn handle_inbound_message(state: &Arc<AppState>, tenant: &Arc<TenantContex
         );
         return;
     };
+    let inbound_content = inline_inbound_images(state, tenant, inbound_content).await;
 
     maybe_forward_to_lowcode_agent(
         state,
@@ -391,6 +394,181 @@ fn build_wechat_cdn_download_url(encrypted_query_param: &str) -> String {
     )
 }
 
+async fn inline_inbound_images(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    content: Value,
+) -> Value {
+    let Some(parts) = content.as_array() else {
+        return content;
+    };
+
+    let max_inline_bytes = state.config.runtime.max_inline_image_bytes.max(1);
+    let mut updated = Vec::with_capacity(parts.len());
+    for part in parts {
+        updated.push(inline_image_part(state, tenant, part.clone(), max_inline_bytes).await);
+    }
+
+    Value::Array(updated)
+}
+
+async fn inline_image_part(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    part: Value,
+    max_inline_bytes: usize,
+) -> Value {
+    let is_input_image = part
+        .get("type")
+        .and_then(Value::as_str)
+        .map(|value| value.eq_ignore_ascii_case("input_image"))
+        .unwrap_or(false);
+    if !is_input_image {
+        return part;
+    }
+
+    let Some(original_url) = part
+        .get("image_url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+    else {
+        return part;
+    };
+
+    match build_inline_image_data_url(state, &original_url, max_inline_bytes).await {
+        Ok(Some(data_url)) => {
+            mark_image_part_transfer(part, Value::String(data_url), "inline_data_url")
+        }
+        Ok(None) => {
+            warn!(
+                tenant_id = %tenant.tenant_id,
+                max_inline_bytes,
+                "微信图片超过内联大小上限，继续透传原始链接"
+            );
+            mark_image_part_transfer(
+                part,
+                Value::String(original_url.clone()),
+                "external_url_fallback",
+            )
+        }
+        Err(err) => {
+            warn!(
+                tenant_id = %tenant.tenant_id,
+                error = %err,
+                "微信图片内联失败，继续透传原始链接"
+            );
+            mark_image_part_transfer(part, Value::String(original_url), "external_url_fallback")
+        }
+    }
+}
+
+fn mark_image_part_transfer(mut part: Value, image_url: Value, transfer: &str) -> Value {
+    let Some(object) = part.as_object_mut() else {
+        return part;
+    };
+    object.insert("image_url".to_string(), image_url);
+    object.insert(
+        "imageTransfer".to_string(),
+        Value::String(transfer.to_string()),
+    );
+    part
+}
+
+async fn build_inline_image_data_url(
+    state: &Arc<AppState>,
+    download_url: &str,
+    max_inline_bytes: usize,
+) -> Result<Option<String>, String> {
+    let response = state
+        .http_client
+        .get(download_url)
+        .send()
+        .await
+        .map_err(|err| format!("下载微信图片失败: {err}"))?;
+
+    if let Some(length) = response.content_length()
+        && length > max_inline_bytes as u64
+    {
+        return Ok(None);
+    }
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "(读取微信图片响应失败)".to_string());
+        return Err(format!(
+            "下载微信图片失败 HTTP {}: {}",
+            status.as_u16(),
+            body
+        ));
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| format!("读取微信图片失败: {err}"))?;
+
+    if bytes.len() > max_inline_bytes {
+        return Ok(None);
+    }
+
+    let mime = resolve_image_mime_type(content_type.as_deref(), bytes.as_ref());
+    Ok(Some(format!(
+        "data:{mime};base64,{}",
+        BASE64_STANDARD.encode(bytes)
+    )))
+}
+
+fn resolve_image_mime_type(content_type: Option<&str>, bytes: &[u8]) -> &'static str {
+    if let Some(value) = content_type.and_then(normalize_image_content_type) {
+        return value;
+    }
+    guess_image_mime_type(bytes).unwrap_or("image/png")
+}
+
+fn normalize_image_content_type(content_type: &str) -> Option<&'static str> {
+    let mime = content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    match mime {
+        "image/png" => Some("image/png"),
+        "image/jpeg" => Some("image/jpeg"),
+        "image/gif" => Some("image/gif"),
+        "image/webp" => Some("image/webp"),
+        "image/bmp" => Some("image/bmp"),
+        "image/svg+xml" => Some("image/svg+xml"),
+        "image/x-icon" => Some("image/x-icon"),
+        _ => None,
+    }
+}
+
+fn guess_image_mime_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"BM") {
+        Some("image/bmp")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && bytes[8..12] == *b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
 async fn maybe_forward_to_lowcode_agent(
     state: &Arc<AppState>,
     tenant: &Arc<TenantContext>,
@@ -557,7 +735,11 @@ fn build_lowcode_inbound_endpoint(base_url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_lowcode_inbound_content, build_wechat_cdn_download_url, has_media_items};
+    use super::{
+        build_lowcode_inbound_content, build_wechat_cdn_download_url, guess_image_mime_type,
+        has_media_items, mark_image_part_transfer, normalize_image_content_type,
+    };
+    use serde_json::Value;
     use serde_json::json;
 
     #[test]
@@ -668,5 +850,50 @@ mod tests {
             build_wechat_cdn_download_url("voice-token")
         );
         assert_eq!(content[1]["wechatMedia"]["playtime"], 3760);
+    }
+
+    #[test]
+    fn normalizes_image_content_type_and_guesses_common_formats() {
+        assert_eq!(
+            normalize_image_content_type("image/png; charset=binary"),
+            Some("image/png")
+        );
+        assert_eq!(
+            normalize_image_content_type("application/octet-stream"),
+            None
+        );
+        assert_eq!(
+            guess_image_mime_type(b"\x89PNG\r\n\x1a\nrest"),
+            Some("image/png")
+        );
+        assert_eq!(
+            guess_image_mime_type(b"\xff\xd8\xffrest"),
+            Some("image/jpeg")
+        );
+        assert_eq!(guess_image_mime_type(b"GIF89arest"), Some("image/gif"));
+        assert_eq!(guess_image_mime_type(b"BMrest"), Some("image/bmp"));
+        assert_eq!(
+            guess_image_mime_type(b"RIFF1234WEBPrest"),
+            Some("image/webp")
+        );
+    }
+
+    #[test]
+    fn marks_image_part_with_inline_transfer_metadata() {
+        let part = json!({
+            "type": "input_image",
+            "image_url": "https://example.com/original.png",
+            "source": "wechat"
+        });
+
+        let updated = mark_image_part_transfer(
+            part,
+            Value::String("data:image/png;base64,AAAA".to_string()),
+            "inline_data_url",
+        );
+
+        assert_eq!(updated["image_url"], "data:image/png;base64,AAAA");
+        assert_eq!(updated["imageTransfer"], "inline_data_url");
+        assert_eq!(updated["source"], "wechat");
     }
 }

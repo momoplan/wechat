@@ -10,6 +10,7 @@ runtime:
   event_retention_per_tenant: 200
   poll_retry_seconds: 3
   poll_timeout_seconds: 35
+  max_inline_image_bytes: 5242880
 
 database:
   url: "mysql://root:password@127.0.0.1:3306/wechat?charset=utf8mb4"

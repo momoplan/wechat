@@ -520,9 +520,7 @@ fn infer_media_kind_from_name(name: &str) -> MediaKind {
         .as_deref()
     {
         Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp") => MediaKind::Image,
-        Some("amr" | "wav" | "mp3" | "m4a" | "aac" | "ogg" | "opus" | "silk") => {
-            MediaKind::Audio
-        }
+        Some("amr" | "wav" | "mp3" | "m4a" | "aac" | "ogg" | "opus" | "silk") => MediaKind::Audio,
         Some("mp4" | "mov" | "webm" | "mkv" | "avi") => MediaKind::Video,
         _ => MediaKind::File,
     }

@@ -39,6 +39,8 @@ pub struct RuntimeConfig {
     pub poll_retry_seconds: u64,
     #[serde(default = "default_poll_timeout_seconds")]
     pub poll_timeout_seconds: u64,
+    #[serde(default = "default_max_inline_image_bytes")]
+    pub max_inline_image_bytes: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +125,10 @@ fn default_poll_timeout_seconds() -> u64 {
     35
 }
 
+fn default_max_inline_image_bytes() -> usize {
+    5 * 1024 * 1024
+}
+
 fn default_database_url() -> String {
     "mysql://root:password@127.0.0.1:3306/wechat?charset=utf8mb4".to_string()
 }
@@ -170,6 +176,7 @@ impl Default for AppConfig {
                 event_retention_per_tenant: default_event_retention(),
                 poll_retry_seconds: default_poll_retry_seconds(),
                 poll_timeout_seconds: default_poll_timeout_seconds(),
+                max_inline_image_bytes: default_max_inline_image_bytes(),
             },
             database: DatabaseConfig::default(),
             lowcode_ws: LowcodeWsConfig::default(),

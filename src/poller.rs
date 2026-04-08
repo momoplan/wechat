@@ -1,3 +1,4 @@
+use crate::config::CommandActionConfig;
 use crate::models::ReceivedEvent;
 use crate::state::{AppState, TenantContext};
 use crate::wechat_api;
@@ -12,6 +13,12 @@ use tracing::{error, info, warn};
 
 const LOWCODE_FORWARD_FALLBACK_MESSAGE: &str = "消息暂时处理失败，请稍后重试或联系管理员。";
 const WECHAT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboundCommand {
+    text: String,
+    action: String,
+}
 
 pub async fn run_tenant_poll_worker(
     state: Arc<AppState>,
@@ -169,6 +176,12 @@ async fn handle_inbound_message(state: &Arc<AppState>, tenant: &Arc<TenantContex
 
     let inbound_content = build_lowcode_inbound_content(&msg);
     let has_media = has_media_items(&msg);
+    let inbound_command = detect_inbound_command(
+        message_type,
+        &content,
+        has_media,
+        &state.config.runtime.command_actions,
+    );
     if message_type != Some(1) && !has_media {
         info!(
             tenant_id = %tenant.tenant_id,
@@ -198,6 +211,7 @@ async fn handle_inbound_message(state: &Arc<AppState>, tenant: &Arc<TenantContex
         &msg,
         &from_user_id,
         inbound_content,
+        inbound_command,
         context_token.as_deref(),
     )
     .await;
@@ -262,6 +276,38 @@ fn has_media_items(msg: &Value) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+fn detect_inbound_command(
+    message_type: Option<i64>,
+    content: &str,
+    has_media: bool,
+    command_actions: &[CommandActionConfig],
+) -> Option<InboundCommand> {
+    if message_type != Some(1) || has_media {
+        return None;
+    }
+
+    let text = normalize_command_text(content)?;
+    command_actions.iter().find_map(|item| {
+        if text.eq_ignore_ascii_case(item.text.as_str()) {
+            Some(InboundCommand {
+                text: text.clone(),
+                action: item.action.clone(),
+            })
+        } else {
+            None
+        }
+    })
+}
+
+fn normalize_command_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn build_lowcode_inbound_content(msg: &Value) -> Option<Value> {
@@ -575,6 +621,7 @@ async fn maybe_forward_to_lowcode_agent(
     raw_message: &Value,
     user_id: &str,
     content: Value,
+    inbound_command: Option<InboundCommand>,
     context_token: Option<&str>,
 ) {
     let credential = tenant.credential.read().await.clone();
@@ -608,6 +655,38 @@ async fn maybe_forward_to_lowcode_agent(
         .clone()
         .or_else(|| state.config.channel_gateway.inbound_token.clone());
 
+    let data = match inbound_command {
+        Some(command) => {
+            info!(
+                tenant_id = %tenant.tenant_id,
+                user_id,
+                action = %command.action,
+                command = %command.text,
+                "识别到会话控制命令，改发 session-control"
+            );
+            json!({
+                "type": "session-control",
+                "action": command.action,
+                "source": "wechat-command",
+                "tenantId": tenant.tenant_id.as_str(),
+                "messageType": raw_message.get("message_type"),
+                "fromUserId": user_id,
+                "contextToken": context_token,
+                "command": command.text,
+                "content": content
+            })
+        }
+        None => json!({
+            "type": "input",
+            "source": "wechat",
+            "tenantId": tenant.tenant_id.as_str(),
+            "messageType": raw_message.get("message_type"),
+            "fromUserId": user_id,
+            "contextToken": context_token,
+            "content": content
+        }),
+    };
+
     let body = json!({
         "requestId": raw_message.get("client_id").and_then(Value::as_str),
         "sender": {
@@ -626,15 +705,7 @@ async fn maybe_forward_to_lowcode_agent(
             "contextToken": context_token
         },
         "raw": raw_message,
-        "data": {
-            "type": "input",
-            "source": "wechat",
-            "tenantId": tenant.tenant_id.as_str(),
-            "messageType": raw_message.get("message_type"),
-            "fromUserId": user_id,
-            "contextToken": context_token,
-            "content": content
-        }
+        "data": data
     });
 
     let mut request = state.http_client.post(endpoint).json(&body);
@@ -736,9 +807,11 @@ fn build_lowcode_inbound_endpoint(base_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_lowcode_inbound_content, build_wechat_cdn_download_url, guess_image_mime_type,
-        has_media_items, mark_image_part_transfer, normalize_image_content_type,
+        InboundCommand, build_lowcode_inbound_content, build_wechat_cdn_download_url,
+        detect_inbound_command, guess_image_mime_type, has_media_items, mark_image_part_transfer,
+        normalize_image_content_type,
     };
+    use crate::config::CommandActionConfig;
     use serde_json::Value;
     use serde_json::json;
 
@@ -895,5 +968,89 @@ mod tests {
         assert_eq!(updated["image_url"], "data:image/png;base64,AAAA");
         assert_eq!(updated["imageTransfer"], "inline_data_url");
         assert_eq!(updated["source"], "wechat");
+    }
+
+    #[test]
+    fn detects_new_session_command_from_text_message() {
+        let commands = vec![
+            CommandActionConfig {
+                text: "/new".to_string(),
+                action: "new".to_string(),
+            },
+            CommandActionConfig {
+                text: "/新话题".to_string(),
+                action: "new".to_string(),
+            },
+        ];
+        assert_eq!(
+            detect_inbound_command(Some(1), "/new", false, &commands),
+            Some(InboundCommand {
+                text: "/new".to_string(),
+                action: "new".to_string(),
+            })
+        );
+        assert_eq!(
+            detect_inbound_command(Some(1), " /新话题 ", false, &commands),
+            Some(InboundCommand {
+                text: "/新话题".to_string(),
+                action: "new".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn ignores_non_command_or_non_text_messages() {
+        let commands = vec![
+            CommandActionConfig {
+                text: "/new".to_string(),
+                action: "new".to_string(),
+            },
+            CommandActionConfig {
+                text: "/新话题".to_string(),
+                action: "new".to_string(),
+            },
+        ];
+        assert_eq!(
+            detect_inbound_command(Some(1), "/new 帮我总结一下", false, &commands),
+            None
+        );
+        assert_eq!(
+            detect_inbound_command(Some(2), "/new", true, &commands),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_custom_configured_new_session_command() {
+        let commands = vec![CommandActionConfig {
+            text: "/reset".to_string(),
+            action: "new".to_string(),
+        }];
+        assert_eq!(
+            detect_inbound_command(Some(1), " /reset ", false, &commands),
+            Some(InboundCommand {
+                text: "/reset".to_string(),
+                action: "new".to_string(),
+            })
+        );
+        assert_eq!(
+            detect_inbound_command(Some(1), "/new", false, &commands),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_custom_configured_abort_command() {
+        let commands = vec![CommandActionConfig {
+            text: "/结束".to_string(),
+            action: "abort".to_string(),
+        }];
+        assert_eq!(
+            detect_inbound_command(Some(1), "/结束", false, &commands),
+            Some(InboundCommand {
+                text: "/结束".to_string(),
+                action: "abort".to_string(),
+            })
+        );
     }
 }

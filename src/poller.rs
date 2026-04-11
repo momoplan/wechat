@@ -20,6 +20,12 @@ struct InboundCommand {
     action: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionControlSuccess {
+    action: String,
+    session_id: Option<String>,
+}
+
 pub async fn run_tenant_poll_worker(
     state: Arc<AppState>,
     tenant: Arc<TenantContext>,
@@ -655,7 +661,7 @@ async fn maybe_forward_to_lowcode_agent(
         .clone()
         .or_else(|| state.config.channel_gateway.inbound_token.clone());
 
-    let data = match inbound_command {
+    let data = match inbound_command.as_ref() {
         Some(command) => {
             info!(
                 tenant_id = %tenant.tenant_id,
@@ -715,7 +721,26 @@ async fn maybe_forward_to_lowcode_agent(
 
     match request.send().await {
         Ok(response) if response.status().is_success() => {
-            info!(tenant_id = %tenant.tenant_id, user_id, "微信消息已转发到 channel-gateway");
+            let status = response.status();
+            let response_text = response.text().await.unwrap_or_default();
+            let response_body = serde_json::from_str::<Value>(&response_text).ok();
+            info!(
+                tenant_id = %tenant.tenant_id,
+                user_id,
+                status = %status,
+                "微信消息已转发到 channel-gateway"
+            );
+            if let Some(command) = inbound_command.as_ref() {
+                maybe_reply_session_control_success(
+                    state,
+                    tenant,
+                    user_id,
+                    context_token,
+                    command,
+                    response_body.as_ref(),
+                )
+                .await;
+            }
         }
         Ok(response) => {
             let status = response.status();
@@ -745,6 +770,37 @@ async fn maybe_forward_to_lowcode_agent(
             );
             reply_lowcode_forward_failure(state, tenant, user_id, context_token, None).await;
         }
+    }
+}
+
+async fn maybe_reply_session_control_success(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    user_id: &str,
+    context_token: Option<&str>,
+    command: &InboundCommand,
+    response_body: Option<&Value>,
+) {
+    let Some(reply_text) = session_control_success_reply_text(&command.action) else {
+        return;
+    };
+
+    if let Some(success) = response_body.and_then(extract_session_control_success) {
+        if !success.action.eq_ignore_ascii_case(&command.action) {
+            return;
+        }
+    }
+
+    if let Err(err) =
+        wechat_api::send_text_to_user(state, tenant, user_id, reply_text, context_token).await
+    {
+        warn!(
+            tenant_id = %tenant.tenant_id,
+            user_id,
+            action = %command.action,
+            error = %err,
+            "会话控制命令成功后发送确认消息失败"
+        );
     }
 }
 
@@ -804,12 +860,66 @@ fn build_lowcode_inbound_endpoint(base_url: &str) -> String {
     }
 }
 
+fn extract_session_control_success(payload: &Value) -> Option<SessionControlSuccess> {
+    [
+        Some(payload),
+        payload.get("upstreamBody"),
+        payload.get("upstream_body"),
+        payload.get("data"),
+        payload.pointer("/data/upstreamBody"),
+        payload.pointer("/data/upstream_body"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(parse_session_control_success)
+}
+
+fn parse_session_control_success(payload: &Value) -> Option<SessionControlSuccess> {
+    let message_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    if !message_type.eq_ignore_ascii_case("session-control") {
+        return None;
+    }
+
+    let action = payload
+        .get("action")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let session_id = payload
+        .pointer("/result/sessionId")
+        .or_else(|| payload.pointer("/result/session_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    Some(SessionControlSuccess {
+        action: action.to_string(),
+        session_id,
+    })
+}
+
+fn session_control_success_reply_text(action: &str) -> Option<&'static str> {
+    if action.eq_ignore_ascii_case("new") {
+        Some("已开始新话题，可以继续发送消息了。")
+    } else if action.eq_ignore_ascii_case("activate") {
+        Some("已切换到指定会话，可以继续发送消息了。")
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        InboundCommand, build_lowcode_inbound_content, build_wechat_cdn_download_url,
-        detect_inbound_command, guess_image_mime_type, has_media_items, mark_image_part_transfer,
-        normalize_image_content_type,
+        InboundCommand, SessionControlSuccess, build_lowcode_inbound_content,
+        build_wechat_cdn_download_url, detect_inbound_command, extract_session_control_success,
+        guess_image_mime_type, has_media_items, mark_image_part_transfer,
+        normalize_image_content_type, session_control_success_reply_text,
     };
     use crate::config::CommandActionConfig;
     use serde_json::Value;
@@ -1052,5 +1162,61 @@ mod tests {
                 action: "abort".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn extracts_session_control_success_from_direct_response() {
+        let payload = json!({
+            "type": "session-control",
+            "action": "new",
+            "result": {
+                "sessionId": "sess_123"
+            }
+        });
+
+        assert_eq!(
+            extract_session_control_success(&payload),
+            Some(SessionControlSuccess {
+                action: "new".to_string(),
+                session_id: Some("sess_123".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn extracts_session_control_success_from_wrapped_response() {
+        let payload = json!({
+            "data": {
+                "status": "accepted",
+                "upstreamBody": {
+                    "type": "session-control",
+                    "action": "activate",
+                    "result": {
+                        "session_id": "sess_456"
+                    }
+                }
+            }
+        });
+
+        assert_eq!(
+            extract_session_control_success(&payload),
+            Some(SessionControlSuccess {
+                action: "activate".to_string(),
+                session_id: Some("sess_456".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn returns_confirmation_text_for_supported_session_control_actions() {
+        assert_eq!(
+            session_control_success_reply_text("new"),
+            Some("已开始新话题，可以继续发送消息了。")
+        );
+        assert_eq!(
+            session_control_success_reply_text("activate"),
+            Some("已切换到指定会话，可以继续发送消息了。")
+        );
+        assert_eq!(session_control_success_reply_text("abort"), None);
     }
 }

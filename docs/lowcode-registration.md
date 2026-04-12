@@ -25,6 +25,7 @@ curl -X POST "$LOWCODE_BASE/api/external-manage-service/create" \
 ```
 
 返回 `data.id` 即 `externalManageServiceId`。
+这里的 `baseUrl` 存在服务注册记录上，不是模块插件配置字段。
 
 ## 2. 绑定到目标 type5 模块项目
 
@@ -42,6 +43,19 @@ curl -X POST "$LOWCODE_BASE/api/module-manage-config/create" \
 其中：
 - `projectId`: 微信模块项目 ID
 - `externalManageServiceId`: 第一步返回 ID
+
+模块最终生效的 `external-managed` 插件绑定应等价于：
+
+```json
+{
+  "pluginId": "external-managed",
+  "config": {
+    "serviceId": 67890
+  }
+}
+```
+
+不要再写 `baseUrl` / `manageUrl`。
 
 ## 3. 模块 propertyDefinition 建议
 
@@ -89,6 +103,8 @@ cat docs/module-property-definition.json | jq -c .
   - `outboundToken`
   - `lowcodeForwardEnabled`
   - `autoStart`
+
+这里的 `baseUrl` 指微信 iLink API 地址，不是 external-manage-service 地址。
 
 参考模板：`docs/lowcode-module-definition.template.json`
 

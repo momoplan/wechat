@@ -147,11 +147,12 @@ curl 'http://127.0.0.1:3211/tenants/demo/events?limit=20'
 - `POST /external-module/updateProperties`
 - `GET /external-module/{externalId}/runtimeStatus`
 
-建议把 lowcode 里的 `baseUrl` 配置为：
+接入 lowcode 时按下面约定：
 
-```text
-http://<wechat-host>:3211/external-module
-```
+- `external-manage-service` 注册记录里的 `baseUrl` 配成 `http://<wechat-host>:3211/external-module`
+- 模块 `external-managed` 插件绑定只写 `plugins[].config.serviceId`
+- 不要再在模块插件配置里写 `baseUrl` / `manageUrl`
+- 这里 `properties/currentProperties.baseUrl` 仍然表示微信 iLink API 地址，不是 external-manage-service 地址
 
 `properties/currentProperties` 常用字段：
 

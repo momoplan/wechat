@@ -270,6 +270,12 @@ async fn maybe_forward_to_lowcode_agent(
     };
 
     let endpoint = build_lowcode_inbound_endpoint(base_url);
+    let workspace_id = credential
+        .workspace_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
     let auth_token = credential
         .lowcode_ws_token
         .clone()
@@ -288,6 +294,7 @@ async fn maybe_forward_to_lowcode_agent(
         },
         "replyTo": {
             "channel": "wechat",
+            "workspaceId": workspace_id,
             "tenantId": tenant.tenant_id.as_str(),
             "userId": user_id,
             "contextToken": context_token

@@ -345,8 +345,11 @@ fn build_credential(
 ) -> Result<TenantCredential, String> {
     let gateway_reference =
         extract_external_service_reference(properties, &["gatewayUrl", "gateway_url"])?;
+    let workspace_id = extract_data_string(properties, &["workspaceId", "workspace_id"])?
+        .or_else(|| existing.and_then(|value| value.workspace_id.clone()));
 
     Ok(TenantCredential {
+        workspace_id,
         bot_token: extract_data_string(properties, &["botToken", "bot_token", "token"])?
             .or_else(|| existing.and_then(|value| value.bot_token.clone())),
         api_base_url: extract_data_string(properties, &["baseUrl", "apiBaseUrl", "api_base_url"])?
@@ -523,6 +526,9 @@ fn merge_response_properties(
         "tenantId".to_string(),
         data_string_value(external_id.to_string()),
     );
+    if let Some(workspace_id) = summary.workspace_id.clone() {
+        properties.insert("workspaceId".to_string(), data_string_value(workspace_id));
+    }
     properties.insert(
         "instanceId".to_string(),
         data_string_value(external_id.to_string()),
@@ -745,6 +751,7 @@ mod tests {
     fn merge_response_properties_returns_typed_values() {
         let summary = crate::models::TenantSummary {
             tenant_id: "tenant-123".to_string(),
+            workspace_id: Some("1106".to_string()),
             logged_in: true,
             bot_token_masked: None,
             api_base_url: Some("https://ilinkai.weixin.qq.com".to_string()),
@@ -756,6 +763,7 @@ mod tests {
             connection: crate::models::ConnectionStatus::default(),
         };
         let credential = crate::models::TenantCredential {
+            workspace_id: Some("1106".to_string()),
             bot_token: None,
             api_base_url: summary.api_base_url.clone(),
             account_id: None,

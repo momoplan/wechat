@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantCredential {
+    #[serde(default, alias = "workspaceId")]
+    pub workspace_id: Option<String>,
     #[serde(default, alias = "botToken")]
     pub bot_token: Option<String>,
     #[serde(default, alias = "baseUrl")]
@@ -66,6 +68,7 @@ impl TenantCredential {
 #[derive(Debug, Clone, Serialize)]
 pub struct TenantSummary {
     pub tenant_id: String,
+    pub workspace_id: Option<String>,
     pub logged_in: bool,
     pub bot_token_masked: Option<String>,
     pub api_base_url: Option<String>,

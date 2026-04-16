@@ -33,7 +33,7 @@ impl TenantStore {
 
     pub async fn list_tenants(&self) -> Result<Vec<PersistedTenant>> {
         let rows = sqlx::query(
-            "SELECT tenant_id, bot_token, api_base_url, account_id, user_id, sync_buf, lowcode_ws_base_url, lowcode_ws_token, outbound_token, lowcode_forward_enabled, enabled FROM wechat_tenant_credentials ORDER BY tenant_id ASC",
+            "SELECT tenant_id, workspace_id, bot_token, api_base_url, account_id, user_id, sync_buf, lowcode_ws_base_url, lowcode_ws_token, outbound_token, lowcode_forward_enabled, enabled FROM wechat_tenant_credentials ORDER BY tenant_id ASC",
         )
         .fetch_all(&self.pool)
         .await
@@ -44,6 +44,7 @@ impl TenantStore {
             out.push(PersistedTenant {
                 tenant_id: row.get("tenant_id"),
                 credential: TenantCredential {
+                    workspace_id: row.get("workspace_id"),
                     bot_token: row.get("bot_token"),
                     api_base_url: row.get("api_base_url"),
                     account_id: row.get("account_id"),
@@ -68,10 +69,11 @@ impl TenantStore {
         sqlx::query(
             r#"
             INSERT INTO wechat_tenant_credentials (
-              tenant_id, bot_token, api_base_url, account_id, user_id, sync_buf, lowcode_ws_base_url, lowcode_ws_token, outbound_token, lowcode_forward_enabled, enabled
+              tenant_id, workspace_id, bot_token, api_base_url, account_id, user_id, sync_buf, lowcode_ws_base_url, lowcode_ws_token, outbound_token, lowcode_forward_enabled, enabled
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
+              workspace_id = VALUES(workspace_id),
               bot_token = VALUES(bot_token),
               api_base_url = VALUES(api_base_url),
               account_id = VALUES(account_id),
@@ -86,6 +88,7 @@ impl TenantStore {
             "#,
         )
         .bind(tenant_id)
+        .bind(credential.workspace_id.as_deref())
         .bind(credential.bot_token.as_deref())
         .bind(credential.api_base_url.as_deref())
         .bind(credential.account_id.as_deref())
@@ -140,6 +143,7 @@ impl TenantStore {
             r#"
             CREATE TABLE IF NOT EXISTS wechat_tenant_credentials (
               tenant_id VARCHAR(128) PRIMARY KEY,
+              workspace_id VARCHAR(128) NULL,
               bot_token VARCHAR(255) NULL,
               api_base_url VARCHAR(512) NULL,
               account_id VARCHAR(255) NULL,
@@ -158,6 +162,11 @@ impl TenantStore {
         .await
         .context("初始化 wechat_tenant_credentials 表失败")?;
 
+        self.add_column_if_missing(
+            "ALTER TABLE wechat_tenant_credentials ADD COLUMN workspace_id VARCHAR(128) NULL",
+            "workspace_id",
+        )
+        .await?;
         self.add_column_if_missing(
             "ALTER TABLE wechat_tenant_credentials ADD COLUMN bot_token VARCHAR(255) NULL",
             "bot_token",

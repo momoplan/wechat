@@ -131,6 +131,7 @@ impl TenantContext {
         let logged_in = credential.is_logged_in();
         TenantSummary {
             tenant_id: self.tenant_id.clone(),
+            workspace_id: credential.workspace_id,
             logged_in,
             bot_token_masked: credential.bot_token.as_deref().map(mask_secret),
             api_base_url: credential.api_base_url,

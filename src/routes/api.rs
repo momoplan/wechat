@@ -1,11 +1,14 @@
 use crate::error::ServiceError;
-use crate::models::{SendSessionMessageRequest, SendTextMessageRequest};
+use crate::models::{SendMediaMessageRequest, SendSessionMessageRequest, SendTextMessageRequest};
 use crate::state::{AppState, TenantContext};
 use crate::wechat_api;
 use actix_web::{HttpRequest, HttpResponse, Scope, web};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
+
+const MAX_WECHAT_TEXT_CHARS: usize = 1800;
+const MAX_WECHAT_CHUNK_LABEL_CHARS: usize = 16;
 
 #[derive(Debug, Deserialize)]
 struct TenantPath {
@@ -34,6 +37,17 @@ struct ChannelCallbackRequest {
     data: Value,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum OutboundDelivery {
+    Text(String),
+    Media {
+        text: Option<String>,
+        media_url: String,
+        media_type: Option<String>,
+        file_name: Option<String>,
+    },
+}
+
 pub fn scope() -> Scope {
     web::scope("")
         .service(super::compat::scope())
@@ -45,6 +59,10 @@ pub fn scope() -> Scope {
         .route(
             "/tenants/{tenant_id}/messages/text",
             web::post().to(send_text_message),
+        )
+        .route(
+            "/tenants/{tenant_id}/messages/media",
+            web::post().to(send_media_message),
         )
         .route(
             "/internal/channel/callback",
@@ -96,6 +114,21 @@ async fn send_text_message(
     let tenant = get_tenant(state.get_ref(), &path.tenant_id)?;
     let data =
         wechat_api::send_text_message(state.get_ref(), &tenant, payload.into_inner()).await?;
+
+    Ok(HttpResponse::Ok().json(json!({
+        "tenant_id": path.tenant_id,
+        "data": data
+    })))
+}
+
+async fn send_media_message(
+    path: web::Path<TenantPath>,
+    payload: web::Json<SendMediaMessageRequest>,
+    state: web::Data<Arc<AppState>>,
+) -> Result<HttpResponse, ServiceError> {
+    let tenant = get_tenant(state.get_ref(), &path.tenant_id)?;
+    let data =
+        wechat_api::send_media_message(state.get_ref(), &tenant, payload.into_inner()).await?;
 
     Ok(HttpResponse::Ok().json(json!({
         "tenant_id": path.tenant_id,
@@ -164,7 +197,7 @@ async fn handle_channel_callback(
             .and_then(|value| value_string(value, &["contextToken", "context_token"]))
     });
 
-    let Some(text) = extract_reply_text(&payload.data) else {
+    let Some(delivery) = extract_reply_delivery(&payload.data) else {
         return Ok(HttpResponse::Ok().json(json!({
             "accepted": true,
             "delivered": false,
@@ -173,22 +206,46 @@ async fn handle_channel_callback(
     };
 
     let tenant = get_tenant(state.get_ref(), &tenant_id)?;
-    let text = if let Some(bind_url) = extract_bind_url(&payload.data) {
-        let bind_prompt = extract_bind_prompt(&payload.data).unwrap_or_else(|| text.clone());
-        format!("{bind_prompt}\n{bind_url}")
-    } else {
-        text
-    };
-    let text = truncate_text(text, 1800);
-
-    wechat_api::send_text_to_user(
-        state.get_ref(),
-        &tenant,
-        &user_id,
-        &text,
-        context_token.as_deref(),
-    )
-    .await?;
+    match delivery {
+        OutboundDelivery::Text(text) => {
+            send_text_chunks(
+                state.get_ref(),
+                &tenant,
+                &user_id,
+                &text,
+                context_token.as_deref(),
+            )
+            .await?;
+        }
+        OutboundDelivery::Media {
+            text,
+            media_url,
+            media_type,
+            file_name,
+        } => {
+            if let Some(text) = text {
+                send_text_chunks(
+                    state.get_ref(),
+                    &tenant,
+                    &user_id,
+                    &text,
+                    context_token.as_deref(),
+                )
+                .await?;
+            }
+            wechat_api::send_media_to_user(
+                state.get_ref(),
+                &tenant,
+                &user_id,
+                None,
+                media_url,
+                context_token.as_deref(),
+                media_type,
+                file_name,
+            )
+            .await?;
+        }
+    }
 
     Ok(HttpResponse::Ok().json(json!({
         "accepted": true,
@@ -323,28 +380,33 @@ fn is_callback_authorized(req: &HttpRequest, expected_tokens: &[String]) -> bool
     false
 }
 
-fn extract_reply_text(data: &Value) -> Option<String> {
+fn extract_reply_delivery(data: &Value) -> Option<OutboundDelivery> {
     let message_type = data
         .get("type")
         .and_then(|value| value.as_str())
         .unwrap_or("");
-    if data
-        .get("streaming")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(false)
-    {
-        return None;
-    }
     if message_type.eq_ignore_ascii_case("agent-message-ack")
         || message_type.eq_ignore_ascii_case("session-created")
-        || message_type.eq_ignore_ascii_case("complete")
-        || message_type.contains("delta")
     {
         return None;
     }
 
-    if let Some(text) = data.pointer("/content").and_then(extract_text_content) {
-        return Some(text);
+    if let Some(delivery) = data
+        .pointer("/result/output")
+        .and_then(extract_content_delivery)
+    {
+        return Some(delivery);
+    }
+    if let Some(delivery) = data.get("content").and_then(extract_content_delivery) {
+        return Some(delivery);
+    }
+    if let Some((media_url, media_type, file_name)) = extract_media_candidate(data) {
+        return Some(OutboundDelivery::Media {
+            text: extract_text_content(data),
+            media_url,
+            media_type,
+            file_name,
+        });
     }
     if let Some(text) = data
         .get("text")
@@ -352,7 +414,7 @@ fn extract_reply_text(data: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        return Some(text.to_string());
+        return Some(OutboundDelivery::Text(text.to_string()));
     }
     if let Some(text) = data
         .get("content")
@@ -360,7 +422,7 @@ fn extract_reply_text(data: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        return Some(text.to_string());
+        return Some(OutboundDelivery::Text(text.to_string()));
     }
     if let Some(text) = data
         .get("message")
@@ -368,7 +430,7 @@ fn extract_reply_text(data: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        return Some(text.to_string());
+        return Some(OutboundDelivery::Text(text.to_string()));
     }
     if let Some(text) = data
         .pointer("/error/message")
@@ -376,36 +438,210 @@ fn extract_reply_text(data: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        return Some(format!("请求失败: {}", text));
+        return Some(OutboundDelivery::Text(format!("请求失败: {}", text)));
+    }
+    if let Some(text) = data
+        .pointer("/result/error/message")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(OutboundDelivery::Text(format!("请求失败: {}", text)));
     }
 
     serde_json::to_string(data)
         .ok()
         .map(|text| text.trim().to_string())
         .filter(|text| !text.is_empty() && text != "{}")
+        .map(OutboundDelivery::Text)
 }
 
-fn extract_bind_url(data: &Value) -> Option<String> {
-    data.pointer("/error/bindUrl")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
+fn extract_content_delivery(value: &Value) -> Option<OutboundDelivery> {
+    match value {
+        Value::String(text) => normalize_text(text).map(OutboundDelivery::Text),
+        Value::Array(items) => {
+            let mut text_parts = Vec::new();
+            let mut media: Option<(String, Option<String>, Option<String>)> = None;
+
+            for item in items {
+                if let Some(text) = extract_text_item(item) {
+                    text_parts.push(text);
+                }
+                if media.is_none() {
+                    media = extract_media_candidate(item);
+                }
+            }
+
+            let text = if text_parts.is_empty() {
+                None
+            } else {
+                Some(text_parts.join("\n\n"))
+            };
+
+            if let Some((media_url, media_type, file_name)) = media {
+                Some(OutboundDelivery::Media {
+                    text,
+                    media_url,
+                    media_type,
+                    file_name,
+                })
+            } else {
+                text.map(OutboundDelivery::Text)
+            }
+        }
+        Value::Object(map) => {
+            if let Some((media_url, media_type, file_name)) = extract_media_candidate(value) {
+                let text = map
+                    .get("text")
+                    .and_then(extract_text_content)
+                    .or_else(|| map.get("caption").and_then(extract_text_content))
+                    .or_else(|| map.get("message").and_then(extract_text_content));
+                return Some(OutboundDelivery::Media {
+                    text,
+                    media_url,
+                    media_type,
+                    file_name,
+                });
+            }
+
+            map.get("text")
+                .and_then(extract_text_content)
+                .or_else(|| map.get("content").and_then(extract_text_content))
+                .or_else(|| map.get("message").and_then(extract_text_content))
+                .map(OutboundDelivery::Text)
+        }
+        _ => None,
+    }
 }
 
-fn extract_bind_prompt(data: &Value) -> Option<String> {
-    data.pointer("/error/displayMessage")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| {
-            data.pointer("/error/message")
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
+fn extract_text_item(value: &Value) -> Option<String> {
+    match value {
+        Value::Object(map) => {
+            let item_type = map.get("type").and_then(Value::as_str).unwrap_or("");
+            if item_type.eq_ignore_ascii_case("input_text")
+                || item_type.eq_ignore_ascii_case("output_text")
+                || item_type.eq_ignore_ascii_case("text")
+            {
+                map.get("text")
+                    .and_then(extract_text_content)
+                    .or_else(|| map.get("content").and_then(extract_text_content))
+            } else {
+                map.get("text")
+                    .and_then(extract_text_content)
+                    .or_else(|| map.get("content").and_then(extract_text_content))
+            }
+        }
+        _ => extract_text_content(value),
+    }
+}
+
+fn extract_media_candidate(value: &Value) -> Option<(String, Option<String>, Option<String>)> {
+    let Value::Object(map) = value else {
+        return None;
+    };
+
+    let direct = [
+        ("imageUrl", Some("image")),
+        ("image_url", Some("image")),
+        ("audioUrl", Some("audio")),
+        ("audio_url", Some("audio")),
+        ("voiceUrl", Some("audio")),
+        ("voice_url", Some("audio")),
+        ("videoUrl", Some("video")),
+        ("video_url", Some("video")),
+        ("fileUrl", Some("file")),
+        ("file_url", Some("file")),
+        ("mediaUrl", None),
+        ("media_url", None),
+    ];
+
+    for (key, kind) in direct {
+        if let Some(url) = map
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let media_type = kind
                 .map(ToString::to_string)
-        })
+                .or_else(|| optional_media_type(map));
+            return Some((url.to_string(), media_type, optional_file_name(map)));
+        }
+    }
+
+    for (key, kind) in [
+        ("image_url", Some("image")),
+        ("audio_url", Some("audio")),
+        ("voice_url", Some("audio")),
+        ("video_url", Some("video")),
+        ("file_url", Some("file")),
+    ] {
+        if let Some(url) = map
+            .get(key)
+            .and_then(|value| match value {
+                Value::String(text) => Some(text.as_str()),
+                Value::Object(object) => object.get("url").and_then(Value::as_str),
+                _ => None,
+            })
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some((
+                url.to_string(),
+                kind.map(ToString::to_string),
+                optional_file_name(map),
+            ));
+        }
+    }
+
+    let item_type = map.get("type").and_then(Value::as_str).unwrap_or("");
+    if (item_type.eq_ignore_ascii_case("image_url")
+        || item_type.eq_ignore_ascii_case("input_image")
+        || item_type.eq_ignore_ascii_case("audio_url")
+        || item_type.eq_ignore_ascii_case("input_audio")
+        || item_type.eq_ignore_ascii_case("voice_url")
+        || item_type.eq_ignore_ascii_case("input_voice")
+        || item_type.eq_ignore_ascii_case("video_url")
+        || item_type.eq_ignore_ascii_case("file_url"))
+        && let Some(url) = map
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        let media_type = if item_type.contains("image") {
+            Some("image".to_string())
+        } else if item_type.contains("audio") || item_type.contains("voice") {
+            Some("audio".to_string())
+        } else if item_type.contains("video") {
+            Some("video".to_string())
+        } else if item_type.contains("file") {
+            Some("file".to_string())
+        } else {
+            optional_media_type(map)
+        };
+        return Some((url.to_string(), media_type, optional_file_name(map)));
+    }
+
+    None
+}
+
+fn optional_media_type(map: &serde_json::Map<String, Value>) -> Option<String> {
+    map.get("mediaType")
+        .or_else(|| map.get("media_type"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn optional_file_name(map: &serde_json::Map<String, Value>) -> Option<String> {
+    map.get("fileName")
+        .or_else(|| map.get("file_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn extract_text_content(value: &Value) -> Option<String> {
@@ -437,10 +673,310 @@ fn normalize_text(text: &str) -> Option<String> {
     }
 }
 
-fn truncate_text(text: String, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        text
-    } else {
-        text.chars().take(limit).collect()
+async fn send_text_chunks(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    user_id: &str,
+    text: &str,
+    context_token: Option<&str>,
+) -> Result<(), ServiceError> {
+    for chunk in split_text_chunks(text, MAX_WECHAT_TEXT_CHARS) {
+        wechat_api::send_text_to_user(state, tenant, user_id, &chunk, context_token).await?;
+    }
+    Ok(())
+}
+
+fn split_text_chunks(text: &str, limit: usize) -> Vec<String> {
+    if limit <= MAX_WECHAT_CHUNK_LABEL_CHARS {
+        return split_text_chunks_raw(text, limit);
+    }
+
+    let reserve = MAX_WECHAT_CHUNK_LABEL_CHARS.min(limit.saturating_sub(1));
+    let content_limit = limit - reserve;
+    let raw_chunks = split_text_chunks_raw(text, content_limit);
+    if raw_chunks.len() <= 1 {
+        return raw_chunks;
+    }
+
+    let total = raw_chunks.len();
+    raw_chunks
+        .into_iter()
+        .enumerate()
+        .map(|(index, chunk)| format!("（{}/{}）\n{}", index + 1, total, chunk))
+        .collect()
+}
+
+fn split_text_chunks_raw(text: &str, limit: usize) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0;
+
+    for segment in trimmed.split_inclusive('\n') {
+        let segment_len = segment.chars().count();
+        if segment_len > limit {
+            flush_chunk(&mut chunks, &mut current, &mut current_len);
+            split_long_segment(segment, limit, &mut chunks);
+            continue;
+        }
+
+        if current_len + segment_len > limit {
+            flush_chunk(&mut chunks, &mut current, &mut current_len);
+        }
+
+        current.push_str(segment);
+        current_len += segment_len;
+    }
+
+    flush_chunk(&mut chunks, &mut current, &mut current_len);
+    chunks
+}
+
+fn flush_chunk(chunks: &mut Vec<String>, current: &mut String, current_len: &mut usize) {
+    let normalized = current.trim_end_matches('\n').trim();
+    if !normalized.is_empty() {
+        chunks.push(normalized.to_string());
+    }
+    current.clear();
+    *current_len = 0;
+}
+
+fn split_long_segment(segment: &str, limit: usize, chunks: &mut Vec<String>) {
+    let mut current = String::new();
+    let mut current_len = 0;
+
+    for ch in segment.chars() {
+        if current_len >= limit {
+            let normalized = current.trim_end_matches('\n').trim();
+            if !normalized.is_empty() {
+                chunks.push(normalized.to_string());
+            }
+            current.clear();
+            current_len = 0;
+        }
+        current.push(ch);
+        current_len += 1;
+    }
+
+    let normalized = current.trim_end_matches('\n').trim();
+    if !normalized.is_empty() {
+        chunks.push(normalized.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OutboundDelivery, extract_reply_delivery, split_text_chunks};
+    use serde_json::json;
+
+    #[test]
+    fn extract_reply_text_supports_plain_text_links() {
+        let data = json!({
+            "type": "agentMessage",
+            "content": {
+                "text": "请打开 https://example.com/path?a=1"
+            }
+        });
+
+        assert_eq!(
+            extract_reply_delivery(&data),
+            Some(OutboundDelivery::Text(
+                "请打开 https://example.com/path?a=1".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn extract_reply_text_ignores_ack_messages_only() {
+        let ack = json!({
+            "type": "agent-message-ack",
+            "content": {"text": "ok"}
+        });
+
+        assert_eq!(extract_reply_delivery(&ack), None);
+    }
+
+    #[test]
+    fn extract_reply_text_preserves_tool_and_stream_payloads() {
+        let streaming = json!({
+            "type": "message",
+            "streaming": true,
+            "content": {"text": "partial"}
+        });
+        let tool_call = json!({
+            "type": "tool-call",
+            "toolName": "dispatch_subagent"
+        });
+
+        assert_eq!(
+            extract_reply_delivery(&streaming),
+            Some(OutboundDelivery::Text("partial".to_string()))
+        );
+        let extracted = extract_reply_delivery(&tool_call).expect("should fallback to json");
+        match extracted {
+            OutboundDelivery::Text(text) => assert!(text.contains("tool-call")),
+            other => panic!("unexpected delivery: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extract_reply_text_reads_complete_result_output() {
+        let data = json!({
+            "type": "complete",
+            "result": {
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "output_text", "text": "最终结果"}
+                    ]
+                }]
+            }
+        });
+
+        assert_eq!(
+            extract_reply_delivery(&data),
+            Some(OutboundDelivery::Text("最终结果".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_reply_delivery_reads_agent_error_content() {
+        let data = json!({
+            "type": "agent-error",
+            "content": [
+                {"type": "text", "text": "读取个人飞书文档前需要先授权。"},
+                {"type": "text", "text": "授权链接：https://example.com/oauth"}
+            ],
+            "error": {
+                "code": "USER_NOT_BOUND"
+            }
+        });
+
+        assert_eq!(
+            extract_reply_delivery(&data),
+            Some(OutboundDelivery::Text(
+                "读取个人飞书文档前需要先授权。\n\n授权链接：https://example.com/oauth".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn extract_reply_delivery_extracts_media_payload() {
+        let data = json!({
+            "type": "agentMessage",
+            "content": {
+                "imageUrl": "https://example.com/a.png"
+            }
+        });
+
+        assert_eq!(
+            extract_reply_delivery(&data),
+            Some(OutboundDelivery::Media {
+                text: None,
+                media_url: "https://example.com/a.png".to_string(),
+                media_type: Some("image".to_string()),
+                file_name: None,
+            })
+        );
+    }
+
+    #[test]
+    fn extract_reply_delivery_extracts_text_and_media_from_array() {
+        let data = json!({
+            "type": "agentMessage",
+            "content": [
+                {"type": "input_text", "text": "图片如下"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+            ]
+        });
+
+        assert_eq!(
+            extract_reply_delivery(&data),
+            Some(OutboundDelivery::Media {
+                text: Some("图片如下".to_string()),
+                media_url: "https://example.com/a.png".to_string(),
+                media_type: Some("image".to_string()),
+                file_name: None,
+            })
+        );
+    }
+
+    #[test]
+    fn extract_reply_delivery_extracts_audio_payload() {
+        let data = json!({
+            "type": "agentMessage",
+            "content": {
+                "audioUrl": "https://example.com/a.wav",
+                "text": "语音回复"
+            }
+        });
+
+        assert_eq!(
+            extract_reply_delivery(&data),
+            Some(OutboundDelivery::Media {
+                text: Some("语音回复".to_string()),
+                media_url: "https://example.com/a.wav".to_string(),
+                media_type: Some("audio".to_string()),
+                file_name: None,
+            })
+        );
+    }
+
+    #[test]
+    fn extract_reply_delivery_extracts_voice_item_from_array() {
+        let data = json!({
+            "type": "agentMessage",
+            "content": [
+                {"type": "text", "text": "请听语音"},
+                {"type": "input_voice", "url": "https://example.com/a.amr"}
+            ]
+        });
+
+        assert_eq!(
+            extract_reply_delivery(&data),
+            Some(OutboundDelivery::Media {
+                text: Some("请听语音".to_string()),
+                media_url: "https://example.com/a.amr".to_string(),
+                media_type: Some("audio".to_string()),
+                file_name: None,
+            })
+        );
+    }
+
+    #[test]
+    fn split_text_chunks_keeps_short_text_as_single_message() {
+        assert_eq!(
+            split_text_chunks("hello\nworld", 1800),
+            vec!["hello\nworld".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_text_chunks_prefers_newline_boundaries() {
+        let text = format!("{}\n\n{}", "a".repeat(1200), "b".repeat(1200));
+        let chunks = split_text_chunks(&text, 1800);
+
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 1800));
+        assert_eq!(chunks[0], format!("（1/2）\n{}", "a".repeat(1200)));
+        assert_eq!(chunks[1], format!("（2/2）\n{}", "b".repeat(1200)));
+    }
+
+    #[test]
+    fn split_text_chunks_splits_single_oversized_line() {
+        let text = "x".repeat(3800);
+        let chunks = split_text_chunks(&text, 1800);
+
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|chunk| chunk.chars().count() <= 1800));
+        assert!(chunks[0].starts_with("（1/3）\n"));
+        assert!(chunks[1].starts_with("（2/3）\n"));
+        assert!(chunks[2].starts_with("（3/3）\n"));
     }
 }

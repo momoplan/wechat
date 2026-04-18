@@ -1,5 +1,11 @@
 # wechat
 
+微信渠道遵循的平台级协议请优先查看：
+
+- [lowcode/docs/protocols/channel-inbound-protocol.md](/Users/c/lowcode/lowcode/docs/protocols/channel-inbound-protocol.md)
+- [lowcode/docs/protocols/channel-outbound-protocol.md](/Users/c/lowcode/lowcode/docs/protocols/channel-outbound-protocol.md)
+- [lowcode/docs/protocols/message-event-model.md](/Users/c/lowcode/lowcode/docs/protocols/message-event-model.md)
+
 多租户微信通道服务（Rust）。
 
 目标：
@@ -13,6 +19,7 @@
 - 当前实现基于 `https://ilinkai.weixin.qq.com/ilink/bot/*` 这条能力链路。
 - 这不是仓库内能对应到的微信公开标准开放平台 Bot API，建议先按内测/PoC 使用。
 - 当前会话模型只支持私聊：`sessionKey = wechat:dm:<user_id>`。
+- 微信用户发送命中 `runtime.command_actions` 的精确文本命令时，服务会转成 `session-control`，并把映射到的 `action` 原样发给 channel-gateway。
 
 ## 架构
 
@@ -41,6 +48,8 @@ cp config.example.yaml config.yaml
 ```yaml
 database:
   url: "mysql://root:password@127.0.0.1:3306/wechat?charset=utf8mb4"
+runtime:
+  max_inline_image_bytes: 5242880
 ```
 
 `channel_gateway.inbound_token` 用于 lowcode 下行回调鉴权，可选。
@@ -138,11 +147,12 @@ curl 'http://127.0.0.1:3211/tenants/demo/events?limit=20'
 - `POST /external-module/updateProperties`
 - `GET /external-module/{externalId}/runtimeStatus`
 
-建议把 lowcode 里的 `baseUrl` 配置为：
+接入 lowcode 时按下面约定：
 
-```text
-http://<wechat-host>:3211/external-module
-```
+- `external-manage-service` 注册记录里的 `baseUrl` 配成 `http://<wechat-host>:3211/external-module`
+- 模块 `external-managed` 插件绑定只写 `plugins[].config.serviceId`
+- 不要再在模块插件配置里写 `baseUrl` / `manageUrl`
+- 这里 `properties/currentProperties.baseUrl` 仍然表示微信 iLink API 地址，不是 external-manage-service 地址
 
 `properties/currentProperties` 常用字段：
 
@@ -188,7 +198,7 @@ curl -X POST http://127.0.0.1:3210/outbound \
     "eventType":"agentMessage",
     "session":{"scope":"dm","userId":"user_xxx","sessionKey":"wechat:dm:user_xxx"},
     "replyTo":{"channel":"wechat","tenantId":"demo","userId":"user_xxx","contextToken":"ctx_xxx"},
-    "data":{"content":{"text":"hello"}}
+    "data":{"content":[{"type":"text","text":"hello"}]}
   }'
 ```
 
@@ -241,4 +251,5 @@ curl -X POST http://127.0.0.1:3210/outbound \
 - 回消息依赖微信入站消息携带的 `contextToken`。
 - 如果 outbound 没显式传 `contextToken`，服务会尝试使用同租户内该用户最近一次入站消息缓存的 token。
 - lowcode 转发只使用租户级配置 `gateway_url / gateway_token / lowcode_forward_enabled`。
+- 微信图片入站会优先下载并转成 `data:image/...` 内联给下游模型，避免直接透传微信私有 CDN 链接；`runtime.max_inline_image_bytes` 控制内联上限。
 - 转发失败时，服务会尝试给微信用户回一条兜底提示。

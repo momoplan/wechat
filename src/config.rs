@@ -39,6 +39,18 @@ pub struct RuntimeConfig {
     pub poll_retry_seconds: u64,
     #[serde(default = "default_poll_timeout_seconds")]
     pub poll_timeout_seconds: u64,
+    #[serde(default = "default_max_inline_image_bytes")]
+    pub max_inline_image_bytes: usize,
+    #[serde(default = "default_command_actions")]
+    pub command_actions: Vec<CommandActionConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandActionConfig {
+    #[serde(default, alias = "command")]
+    pub text: String,
+    #[serde(default)]
+    pub action: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,6 +135,23 @@ fn default_poll_timeout_seconds() -> u64 {
     35
 }
 
+fn default_max_inline_image_bytes() -> usize {
+    5 * 1024 * 1024
+}
+
+fn default_command_actions() -> Vec<CommandActionConfig> {
+    vec![
+        CommandActionConfig {
+            text: "/new".to_string(),
+            action: "new".to_string(),
+        },
+        CommandActionConfig {
+            text: "/新话题".to_string(),
+            action: "new".to_string(),
+        },
+    ]
+}
+
 fn default_database_url() -> String {
     "mysql://root:password@127.0.0.1:3306/wechat?charset=utf8mb4".to_string()
 }
@@ -170,6 +199,8 @@ impl Default for AppConfig {
                 event_retention_per_tenant: default_event_retention(),
                 poll_retry_seconds: default_poll_retry_seconds(),
                 poll_timeout_seconds: default_poll_timeout_seconds(),
+                max_inline_image_bytes: default_max_inline_image_bytes(),
+                command_actions: default_command_actions(),
             },
             database: DatabaseConfig::default(),
             lowcode_ws: LowcodeWsConfig::default(),
@@ -181,6 +212,36 @@ impl Default for AppConfig {
                 log_dir: default_log_dir(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommandActionConfig, RuntimeConfig, default_command_actions};
+
+    #[test]
+    fn runtime_defaults_include_default_command_actions() {
+        let runtime = RuntimeConfig {
+            event_retention_per_tenant: 200,
+            poll_retry_seconds: 3,
+            poll_timeout_seconds: 35,
+            max_inline_image_bytes: 1024,
+            command_actions: default_command_actions(),
+        };
+
+        assert_eq!(
+            runtime.command_actions,
+            vec![
+                CommandActionConfig {
+                    text: "/new".to_string(),
+                    action: "new".to_string(),
+                },
+                CommandActionConfig {
+                    text: "/新话题".to_string(),
+                    action: "new".to_string(),
+                }
+            ]
+        );
     }
 }
 

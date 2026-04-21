@@ -664,7 +664,7 @@ async fn upload_media(
 fn build_media_item(payload: &MediaPayload, uploaded: &UploadedMedia) -> Value {
     let media = json!({
         "encrypt_query_param": uploaded.download_encrypted_query_param,
-        "aes_key": BASE64_STANDARD.encode(hex::decode(&uploaded.aes_key_hex).unwrap_or_default()),
+        "aes_key": BASE64_STANDARD.encode(uploaded.aes_key_hex.as_bytes()),
         "encrypt_type": 1
     });
 
@@ -868,12 +868,12 @@ mod tests {
             json!({
                 "type": 3,
                 "voice_item": {
-                    "media": {
-                        "encrypt_query_param": "voice-token",
-                        "aes_key": "ABEiM0RVZneImaq7zN3u/w==",
-                        "encrypt_type": 1
+                        "media": {
+                            "encrypt_query_param": "voice-token",
+                            "aes_key": "MDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiY2NkZGVlZmY=",
+                            "encrypt_type": 1
+                        }
                     }
-                }
             })
         );
     }

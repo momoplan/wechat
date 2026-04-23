@@ -1,9 +1,10 @@
+use crate::config::CommandActionConfig;
 use crate::error::ServiceError;
 use crate::models::{TenantCredential, TenantSummary};
 use crate::state::AppState;
 use crate::wechat_api;
 use actix_web::{HttpResponse, Responder, Scope, web};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -34,6 +35,21 @@ struct LoginStatusRequest {
     auto_start: Option<bool>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandActionsUpdateRequest {
+    #[serde(default)]
+    command_actions: Vec<CommandActionConfig>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandActionsResponse {
+    tenant_id: String,
+    command_actions: Vec<CommandActionConfig>,
+    source: String,
+}
+
 pub fn scope() -> Scope {
     web::scope("")
         .service(super::compat::scope())
@@ -43,6 +59,18 @@ pub fn scope() -> Scope {
         .route("/tenants/{tenant_id}", web::get().to(get_tenant))
         .route("/tenants/{tenant_id}", web::put().to(upsert_tenant))
         .route("/tenants/{tenant_id}", web::delete().to(delete_tenant))
+        .route(
+            "/tenants/{tenant_id}/command-actions",
+            web::get().to(get_command_actions),
+        )
+        .route(
+            "/tenants/{tenant_id}/command-actions",
+            web::put().to(update_command_actions),
+        )
+        .route(
+            "/tenants/{tenant_id}/command-actions",
+            web::delete().to(delete_command_actions),
+        )
         .route(
             "/tenants/{tenant_id}/connection/start",
             web::post().to(start_connection),
@@ -141,6 +169,75 @@ async fn delete_tenant(
         "deleted": true,
         "tenant_id": tenant_id
     })))
+}
+
+async fn get_command_actions(
+    path: web::Path<String>,
+    state: web::Data<Arc<AppState>>,
+) -> Result<HttpResponse, ServiceError> {
+    let tenant_id = path.into_inner();
+    let tenant = state
+        .get_tenant(&tenant_id)
+        .ok_or_else(|| ServiceError::NotFound(format!("租户不存在: {tenant_id}")))?;
+    let configured = tenant.credential.read().await.command_actions.clone();
+    let (command_actions, source) = match configured {
+        Some(items) => (items, "tenant"),
+        None => (
+            state.config.runtime.command_actions.clone(),
+            "runtime-default",
+        ),
+    };
+    Ok(HttpResponse::Ok().json(CommandActionsResponse {
+        tenant_id,
+        command_actions,
+        source: source.to_string(),
+    }))
+}
+
+async fn update_command_actions(
+    path: web::Path<String>,
+    state: web::Data<Arc<AppState>>,
+    payload: web::Json<CommandActionsUpdateRequest>,
+) -> Result<HttpResponse, ServiceError> {
+    let tenant_id = path.into_inner();
+    let tenant = state
+        .get_tenant(&tenant_id)
+        .ok_or_else(|| ServiceError::NotFound(format!("租户不存在: {tenant_id}")))?;
+    let command_actions = normalize_command_actions(payload.into_inner().command_actions)?;
+    let mut credential = tenant.credential.read().await.clone();
+    credential.command_actions = Some(command_actions.clone());
+    state
+        .tenant_store
+        .upsert_tenant(&tenant_id, &credential)
+        .await?;
+    tenant.update_credential(credential).await;
+    Ok(HttpResponse::Ok().json(CommandActionsResponse {
+        tenant_id,
+        command_actions,
+        source: "tenant".to_string(),
+    }))
+}
+
+async fn delete_command_actions(
+    path: web::Path<String>,
+    state: web::Data<Arc<AppState>>,
+) -> Result<HttpResponse, ServiceError> {
+    let tenant_id = path.into_inner();
+    let tenant = state
+        .get_tenant(&tenant_id)
+        .ok_or_else(|| ServiceError::NotFound(format!("租户不存在: {tenant_id}")))?;
+    let mut credential = tenant.credential.read().await.clone();
+    credential.command_actions = None;
+    state
+        .tenant_store
+        .upsert_tenant(&tenant_id, &credential)
+        .await?;
+    tenant.update_credential(credential).await;
+    Ok(HttpResponse::Ok().json(CommandActionsResponse {
+        tenant_id,
+        command_actions: state.config.runtime.command_actions.clone(),
+        source: "runtime-default".to_string(),
+    }))
 }
 
 async fn start_connection(
@@ -461,6 +558,8 @@ pub(crate) fn normalize_credential(credential: &mut TenantCredential) -> Result<
     credential.lowcode_ws_base_url = normalize_optional(credential.lowcode_ws_base_url.take());
     credential.lowcode_ws_token = normalize_optional(credential.lowcode_ws_token.take());
     credential.outbound_token = normalize_optional(credential.outbound_token.take());
+    credential.command_actions =
+        normalize_optional_command_actions(credential.command_actions.take())?;
     credential.ensure_outbound_token();
 
     if credential.lowcode_forward_enabled.unwrap_or(false)
@@ -472,6 +571,60 @@ pub(crate) fn normalize_credential(credential: &mut TenantCredential) -> Result<
     }
 
     Ok(())
+}
+
+fn normalize_optional_command_actions(
+    command_actions: Option<Vec<CommandActionConfig>>,
+) -> Result<Option<Vec<CommandActionConfig>>, ServiceError> {
+    match command_actions {
+        Some(items) => Ok(Some(normalize_command_actions(items)?)),
+        None => Ok(None),
+    }
+}
+
+fn normalize_command_actions(
+    command_actions: Vec<CommandActionConfig>,
+) -> Result<Vec<CommandActionConfig>, ServiceError> {
+    let mut out = Vec::with_capacity(command_actions.len());
+    for item in command_actions {
+        let text = item.text.trim().to_string();
+        if text.is_empty() {
+            return Err(ServiceError::BadRequest("命令文本不能为空".to_string()));
+        }
+        let action = item.action.trim().to_string();
+        if action.is_empty() {
+            return Err(ServiceError::BadRequest(format!(
+                "命令 {text} 的 action 不能为空"
+            )));
+        }
+        if !matches!(action.as_str(), "new" | "abort" | "activate") {
+            return Err(ServiceError::BadRequest(format!(
+                "命令 {text} 的 action 不支持，当前只允许 new、abort、activate"
+            )));
+        }
+        let session_id = normalize_optional(item.session_id);
+        if action == "activate" && session_id.is_none() {
+            return Err(ServiceError::BadRequest(format!(
+                "命令 {text} 使用 activate 时必须提供 sessionId"
+            )));
+        }
+        if action != "activate" && session_id.is_some() {
+            return Err(ServiceError::BadRequest(format!(
+                "命令 {text} 只有 action=activate 时才允许提供 sessionId"
+            )));
+        }
+        out.push(CommandActionConfig {
+            text,
+            action,
+            session_id,
+        });
+    }
+    if out.is_empty() {
+        return Err(ServiceError::BadRequest(
+            "command_actions 不能为空数组；如需恢复默认请调用删除接口".to_string(),
+        ));
+    }
+    Ok(out)
 }
 
 pub(crate) fn normalize_optional(value: Option<String>) -> Option<String> {

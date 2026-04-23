@@ -18,6 +18,7 @@ const WECHAT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
 struct InboundCommand {
     text: String,
     action: String,
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,12 +183,15 @@ async fn handle_inbound_message(state: &Arc<AppState>, tenant: &Arc<TenantContex
 
     let inbound_content = build_lowcode_inbound_content(&msg);
     let has_media = has_media_items(&msg);
-    let inbound_command = detect_inbound_command(
-        message_type,
-        &content,
-        has_media,
-        &state.config.runtime.command_actions,
-    );
+    let command_actions = tenant
+        .credential
+        .read()
+        .await
+        .command_actions
+        .clone()
+        .unwrap_or_else(|| state.config.runtime.command_actions.clone());
+    let inbound_command =
+        detect_inbound_command(message_type, &content, has_media, &command_actions);
     if message_type != Some(1) && !has_media {
         info!(
             tenant_id = %tenant.tenant_id,
@@ -300,6 +304,7 @@ fn detect_inbound_command(
             Some(InboundCommand {
                 text: text.clone(),
                 action: item.action.clone(),
+                session_id: item.session_id.clone(),
             })
         } else {
             None
@@ -656,12 +661,6 @@ async fn maybe_forward_to_lowcode_agent(
     };
 
     let endpoint = build_lowcode_inbound_endpoint(base_url);
-    let workspace_id = credential
-        .workspace_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
     let auth_token = credential
         .lowcode_ws_token
         .clone()
@@ -685,6 +684,7 @@ async fn maybe_forward_to_lowcode_agent(
                 "fromUserId": user_id,
                 "contextToken": context_token,
                 "command": command.text,
+                "sessionId": command.session_id,
                 "content": content
             })
         }
@@ -712,7 +712,6 @@ async fn maybe_forward_to_lowcode_agent(
         },
         "replyTo": {
             "channel": "wechat",
-            "workspaceId": workspace_id,
             "tenantId": tenant.tenant_id.as_str(),
             "userId": user_id,
             "contextToken": context_token
@@ -1093,10 +1092,12 @@ mod tests {
             CommandActionConfig {
                 text: "/new".to_string(),
                 action: "new".to_string(),
+                session_id: None,
             },
             CommandActionConfig {
                 text: "/新话题".to_string(),
                 action: "new".to_string(),
+                session_id: None,
             },
         ];
         assert_eq!(
@@ -1104,6 +1105,7 @@ mod tests {
             Some(InboundCommand {
                 text: "/new".to_string(),
                 action: "new".to_string(),
+                session_id: None,
             })
         );
         assert_eq!(
@@ -1111,6 +1113,7 @@ mod tests {
             Some(InboundCommand {
                 text: "/新话题".to_string(),
                 action: "new".to_string(),
+                session_id: None,
             })
         );
     }
@@ -1121,10 +1124,12 @@ mod tests {
             CommandActionConfig {
                 text: "/new".to_string(),
                 action: "new".to_string(),
+                session_id: None,
             },
             CommandActionConfig {
                 text: "/新话题".to_string(),
                 action: "new".to_string(),
+                session_id: None,
             },
         ];
         assert_eq!(
@@ -1142,12 +1147,14 @@ mod tests {
         let commands = vec![CommandActionConfig {
             text: "/reset".to_string(),
             action: "new".to_string(),
+            session_id: None,
         }];
         assert_eq!(
             detect_inbound_command(Some(1), " /reset ", false, &commands),
             Some(InboundCommand {
                 text: "/reset".to_string(),
                 action: "new".to_string(),
+                session_id: None,
             })
         );
         assert_eq!(
@@ -1161,12 +1168,31 @@ mod tests {
         let commands = vec![CommandActionConfig {
             text: "/结束".to_string(),
             action: "abort".to_string(),
+            session_id: None,
         }];
         assert_eq!(
             detect_inbound_command(Some(1), "/结束", false, &commands),
             Some(InboundCommand {
                 text: "/结束".to_string(),
                 action: "abort".to_string(),
+                session_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn detects_custom_configured_activate_command() {
+        let commands = vec![CommandActionConfig {
+            text: "/切回订单会话".to_string(),
+            action: "activate".to_string(),
+            session_id: Some("sess_order_123".to_string()),
+        }];
+        assert_eq!(
+            detect_inbound_command(Some(1), "/切回订单会话", false, &commands),
+            Some(InboundCommand {
+                text: "/切回订单会话".to_string(),
+                action: "activate".to_string(),
+                session_id: Some("sess_order_123".to_string()),
             })
         );
     }

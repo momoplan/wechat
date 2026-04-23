@@ -19,7 +19,8 @@
 - 当前实现基于 `https://ilinkai.weixin.qq.com/ilink/bot/*` 这条能力链路。
 - 这不是仓库内能对应到的微信公开标准开放平台 Bot API，建议先按内测/PoC 使用。
 - 当前会话模型只支持私聊：`sessionKey = wechat:dm:<user_id>`。
-- 微信用户发送命中 `runtime.command_actions` 的精确文本命令时，服务会转成 `session-control`，并把映射到的 `action` 原样发给 channel-gateway。
+- 微信用户发送命中命令配置的精确文本命令时，服务会转成 `session-control`，并把映射到的 `action` 原样发给 channel-gateway。
+- 命令配置优先读取租户级动态配置；未配置时回退到 `runtime.command_actions` 默认值。
 
 ## 架构
 
@@ -138,7 +139,49 @@ curl -X POST http://127.0.0.1:3211/tenants/demo/connection/stop
 curl 'http://127.0.0.1:3211/tenants/demo/events?limit=20'
 ```
 
-### 7. external-module 兼容 API
+### 7. 动态读取或修改命令配置
+
+读取当前生效命令：
+
+```bash
+curl http://127.0.0.1:3211/tenants/demo/command-actions
+```
+
+返回里会带：
+- `source=tenant`：当前使用租户自定义命令
+- `source=runtime-default`：当前回退到进程默认命令
+
+更新租户命令：
+
+```bash
+curl -X PUT http://127.0.0.1:3211/tenants/demo/command-actions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commandActions": [
+      { "text": "/new", "action": "new" },
+      { "text": "/结束", "action": "abort" },
+      { "text": "/回到订单会话", "action": "activate", "sessionId": "sess_xxx" }
+    ]
+  }'
+```
+
+当前支持的 action：
+- `new`：基于当前 `sessionKey` 新建并激活会话
+- `abort`：终止当前激活会话
+- `activate`：切换到指定历史 `sessionId`
+
+说明：
+- `activate` 必须带 `sessionId`
+- `new` / `abort` 不允许带 `sessionId`
+- 命令仍然按整条文本精确匹配
+
+删除租户自定义命令并恢复默认：
+
+```bash
+curl -X DELETE http://127.0.0.1:3211/tenants/demo/command-actions
+```
+
+### 8. external-module 兼容 API
 
 - `POST /external-module`
 - `GET /external-module/{externalId}`
@@ -166,6 +209,8 @@ curl 'http://127.0.0.1:3211/tenants/demo/events?limit=20'
 - `outboundToken`
 - `lowcodeForwardEnabled`
 - `autoStart`
+
+命令配置不走 external-module properties，而是走上面的动态管理接口。
 
 ## 业务 API
 

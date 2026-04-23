@@ -51,6 +51,8 @@ pub struct CommandActionConfig {
     pub text: String,
     #[serde(default)]
     pub action: String,
+    #[serde(default, alias = "sessionId", alias = "targetSessionId")]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,10 +146,12 @@ fn default_command_actions() -> Vec<CommandActionConfig> {
         CommandActionConfig {
             text: "/new".to_string(),
             action: "new".to_string(),
+            session_id: None,
         },
         CommandActionConfig {
             text: "/新话题".to_string(),
             action: "new".to_string(),
+            session_id: None,
         },
     ]
 }
@@ -235,10 +239,12 @@ mod tests {
                 CommandActionConfig {
                     text: "/new".to_string(),
                     action: "new".to_string(),
+                    session_id: None,
                 },
                 CommandActionConfig {
                     text: "/新话题".to_string(),
                     action: "new".to_string(),
+                    session_id: None,
                 }
             ]
         );

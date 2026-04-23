@@ -1,3 +1,4 @@
+use crate::config::CommandActionConfig;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -5,8 +6,6 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TenantCredential {
-    #[serde(default, alias = "workspaceId")]
-    pub workspace_id: Option<String>,
     #[serde(default, alias = "botToken")]
     pub bot_token: Option<String>,
     #[serde(default, alias = "baseUrl")]
@@ -34,6 +33,8 @@ pub struct TenantCredential {
     pub lowcode_forward_enabled: Option<bool>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default, alias = "commandActions")]
+    pub command_actions: Option<Vec<CommandActionConfig>>,
 }
 
 impl TenantCredential {
@@ -68,7 +69,6 @@ impl TenantCredential {
 #[derive(Debug, Clone, Serialize)]
 pub struct TenantSummary {
     pub tenant_id: String,
-    pub workspace_id: Option<String>,
     pub logged_in: bool,
     pub bot_token_masked: Option<String>,
     pub api_base_url: Option<String>,
@@ -78,6 +78,7 @@ pub struct TenantSummary {
     pub lowcode_ws_base_url: Option<String>,
     pub lowcode_forward_enabled: Option<bool>,
     pub enabled: bool,
+    pub command_actions_configured: bool,
     pub connection: ConnectionStatus,
 }
 

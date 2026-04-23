@@ -682,7 +682,6 @@ async fn maybe_forward_to_lowcode_agent(
                 "tenantId": tenant.tenant_id.as_str(),
                 "messageType": raw_message.get("message_type"),
                 "fromUserId": user_id,
-                "contextToken": context_token,
                 "command": command.text,
                 "sessionId": command.session_id,
                 "content": content
@@ -694,7 +693,6 @@ async fn maybe_forward_to_lowcode_agent(
             "tenantId": tenant.tenant_id.as_str(),
             "messageType": raw_message.get("message_type"),
             "fromUserId": user_id,
-            "contextToken": context_token,
             "content": content
         }),
     };
@@ -713,8 +711,7 @@ async fn maybe_forward_to_lowcode_agent(
         "replyTo": {
             "channel": "wechat",
             "tenantId": tenant.tenant_id.as_str(),
-            "userId": user_id,
-            "contextToken": context_token
+            "userId": user_id
         },
         "raw": raw_message,
         "data": data

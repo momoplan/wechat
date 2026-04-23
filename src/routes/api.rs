@@ -185,18 +185,6 @@ async fn handle_channel_callback(
             "replyTo.userId/metadata.userId/session.userId/sessionKey 缺失".to_string(),
         )
     })?;
-    let context_token = context_string(
-        payload.reply_to.as_ref(),
-        payload.metadata.as_ref(),
-        &["contextToken", "context_token"],
-    )
-    .or_else(|| {
-        payload
-            .raw
-            .as_ref()
-            .and_then(|value| value_string(value, &["contextToken", "context_token"]))
-    });
-
     let Some(delivery) = extract_reply_delivery(&payload.data) else {
         return Ok(HttpResponse::Ok().json(json!({
             "accepted": true,
@@ -208,14 +196,7 @@ async fn handle_channel_callback(
     let tenant = get_tenant(state.get_ref(), &tenant_id)?;
     match delivery {
         OutboundDelivery::Text(text) => {
-            send_text_chunks(
-                state.get_ref(),
-                &tenant,
-                &user_id,
-                &text,
-                context_token.as_deref(),
-            )
-            .await?;
+            send_text_chunks(state.get_ref(), &tenant, &user_id, &text, None).await?;
         }
         OutboundDelivery::Media {
             text,
@@ -224,14 +205,7 @@ async fn handle_channel_callback(
             file_name,
         } => {
             if let Some(text) = text {
-                send_text_chunks(
-                    state.get_ref(),
-                    &tenant,
-                    &user_id,
-                    &text,
-                    context_token.as_deref(),
-                )
-                .await?;
+                send_text_chunks(state.get_ref(), &tenant, &user_id, &text, None).await?;
             }
             wechat_api::send_media_to_user(
                 state.get_ref(),
@@ -239,7 +213,7 @@ async fn handle_channel_callback(
                 &user_id,
                 None,
                 media_url,
-                context_token.as_deref(),
+                None,
                 media_type,
                 file_name,
             )

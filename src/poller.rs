@@ -2,9 +2,13 @@ use crate::config::CommandActionConfig;
 use crate::models::ReceivedEvent;
 use crate::state::{AppState, TenantContext};
 use crate::wechat_api;
+use aes::Aes128;
+use aes::cipher::{BlockDecryptMut, KeyInit, block_padding::Pkcs7};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use chrono::Utc;
+use ecb::Decryptor;
+use hex::decode as hex_decode;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +17,8 @@ use tracing::{error, info, warn};
 
 const LOWCODE_FORWARD_FALLBACK_MESSAGE: &str = "消息暂时处理失败，请稍后重试或联系管理员。";
 const WECHAT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
+
+type Aes128EcbDec = Decryptor<Aes128>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InboundCommand {
@@ -346,39 +352,19 @@ fn build_lowcode_inbound_content(msg: &Value) -> Option<Value> {
                 }
             }
             2 => {
-                parts.push(build_media_content_part(
-                    item,
-                    "input_image",
-                    "image_url",
-                    "image",
-                ));
+                parts.push(build_media_content_part(item, "image_url", "image"));
                 has_media = true;
             }
             3 => {
-                parts.push(build_media_content_part(
-                    item,
-                    "input_file",
-                    "file_url",
-                    "audio",
-                ));
+                parts.push(build_media_content_part(item, "file", "audio"));
                 has_media = true;
             }
             4 => {
-                parts.push(build_media_content_part(
-                    item,
-                    "input_file",
-                    "file_url",
-                    "file",
-                ));
+                parts.push(build_media_content_part(item, "file", "file"));
                 has_media = true;
             }
             5 => {
-                parts.push(build_media_content_part(
-                    item,
-                    "input_video",
-                    "video_url",
-                    "video",
-                ));
+                parts.push(build_media_content_part(item, "file", "video"));
                 has_media = true;
             }
             _ => {}
@@ -408,7 +394,6 @@ fn build_lowcode_inbound_content(msg: &Value) -> Option<Value> {
 fn build_media_content_part(
     item: &Value,
     part_type: &str,
-    url_key: &str,
     media_kind: &str,
 ) -> Value {
     let detail_key = match media_kind {
@@ -435,10 +420,25 @@ fn build_media_content_part(
     });
 
     if let Some(object) = part.as_object_mut() {
-        object.insert(
-            url_key.to_string(),
-            download_url.map(Value::String).unwrap_or(Value::Null),
-        );
+        match part_type {
+            "image_url" => {
+                object.insert(
+                    "image_url".to_string(),
+                    download_url
+                        .map(|url| json!({ "url": url }))
+                        .unwrap_or(Value::Null),
+                );
+            }
+            "file" => {
+                object.insert(
+                    "file".to_string(),
+                    download_url
+                        .map(|url| json!({ "url": url }))
+                        .unwrap_or(Value::Null),
+                );
+            }
+            _ => {}
+        }
     }
 
     part
@@ -475,18 +475,24 @@ async fn inline_image_part(
     part: Value,
     max_inline_bytes: usize,
 ) -> Value {
-    let is_input_image = part
+    let is_image_part = part
         .get("type")
         .and_then(Value::as_str)
-        .map(|value| value.eq_ignore_ascii_case("input_image"))
+        .map(|value| {
+            value.eq_ignore_ascii_case("image_url") || value.eq_ignore_ascii_case("input_image")
+        })
         .unwrap_or(false);
-    if !is_input_image {
+    if !is_image_part {
         return part;
     }
 
     let Some(original_url) = part
         .get("image_url")
-        .and_then(Value::as_str)
+        .and_then(|value| match value {
+            Value::String(text) => Some(text.as_str()),
+            Value::Object(object) => object.get("url").and_then(Value::as_str),
+            _ => None,
+        })
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
@@ -494,7 +500,7 @@ async fn inline_image_part(
         return part;
     };
 
-    match build_inline_image_data_url(state, &original_url, max_inline_bytes).await {
+    match build_inline_image_data_url(state, &part, &original_url, max_inline_bytes).await {
         Ok(Some(data_url)) => {
             mark_image_part_transfer(part, Value::String(data_url), "inline_data_url")
         }
@@ -525,7 +531,11 @@ fn mark_image_part_transfer(mut part: Value, image_url: Value, transfer: &str) -
     let Some(object) = part.as_object_mut() else {
         return part;
     };
-    object.insert("image_url".to_string(), image_url);
+    let normalized_image_url = match image_url {
+        Value::String(url) => json!({ "url": url }),
+        other => other,
+    };
+    object.insert("image_url".to_string(), normalized_image_url);
     object.insert(
         "imageTransfer".to_string(),
         Value::String(transfer.to_string()),
@@ -535,6 +545,7 @@ fn mark_image_part_transfer(mut part: Value, image_url: Value, transfer: &str) -
 
 async fn build_inline_image_data_url(
     state: &Arc<AppState>,
+    part: &Value,
     download_url: &str,
     max_inline_bytes: usize,
 ) -> Result<Option<String>, String> {
@@ -573,6 +584,7 @@ async fn build_inline_image_data_url(
         .bytes()
         .await
         .map_err(|err| format!("读取微信图片失败: {err}"))?;
+    let bytes = maybe_decrypt_wechat_media(part, bytes.as_ref())?;
 
     if bytes.len() > max_inline_bytes {
         return Ok(None);
@@ -583,6 +595,60 @@ async fn build_inline_image_data_url(
         "data:{mime};base64,{}",
         BASE64_STANDARD.encode(bytes)
     )))
+}
+
+fn maybe_decrypt_wechat_media(part: &Value, bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let Some(aes_key) = extract_wechat_media_aes_key(part)? else {
+        return Ok(bytes.to_vec());
+    };
+    decrypt_aes_ecb(bytes, &aes_key)
+}
+
+fn extract_wechat_media_aes_key(part: &Value) -> Result<Option<[u8; 16]>, String> {
+    let wechat_media = part.get("wechatMedia").unwrap_or(part);
+
+    if let Some(hex_key) = wechat_media
+        .get("aeskey")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return decode_wechat_aes_key_hex(hex_key).map(Some);
+    }
+
+    let Some(encoded_key) = wechat_media
+        .get("media")
+        .and_then(|value| value.get("aes_key"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    let decoded = BASE64_STANDARD
+        .decode(encoded_key)
+        .map_err(|err| format!("解析微信 media.aes_key 失败: {err}"))?;
+    let decoded_str = std::str::from_utf8(&decoded)
+        .map_err(|err| format!("微信 media.aes_key 不是合法 UTF-8: {err}"))?;
+    decode_wechat_aes_key_hex(decoded_str).map(Some)
+}
+
+fn decode_wechat_aes_key_hex(hex_key: &str) -> Result<[u8; 16], String> {
+    let decoded = hex_decode(hex_key).map_err(|err| format!("解析微信 aeskey 失败: {err}"))?;
+    let len = decoded.len();
+    decoded
+        .try_into()
+        .map_err(|_| format!("微信 aeskey 长度非法: {}", len))
+}
+
+fn decrypt_aes_ecb(ciphertext: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
+    let mut buffer = ciphertext.to_vec();
+    let decryptor = Aes128EcbDec::new(key.into());
+    let plaintext = decryptor
+        .decrypt_padded_mut::<Pkcs7>(&mut buffer)
+        .map_err(|err| format!("AES-128-ECB 解密失败: {err}"))?;
+    Ok(plaintext.to_vec())
 }
 
 fn resolve_image_mime_type(content_type: Option<&str>, bytes: &[u8]) -> &'static str {
@@ -920,13 +986,19 @@ fn session_control_success_reply_text(action: &str) -> Option<&'static str> {
 mod tests {
     use super::{
         InboundCommand, SessionControlSuccess, build_lowcode_inbound_content,
-        build_wechat_cdn_download_url, detect_inbound_command, extract_session_control_success,
+        build_wechat_cdn_download_url, decode_wechat_aes_key_hex, decrypt_aes_ecb,
+        detect_inbound_command, extract_session_control_success, extract_wechat_media_aes_key,
         guess_image_mime_type, has_media_items, mark_image_part_transfer,
         normalize_image_content_type, session_control_success_reply_text,
     };
+    use aes::Aes128;
+    use aes::cipher::{BlockEncryptMut, KeyInit, block_padding::Pkcs7};
     use crate::config::CommandActionConfig;
+    use ecb::Encryptor;
     use serde_json::Value;
     use serde_json::json;
+
+    type Aes128EcbEnc = Encryptor<Aes128>;
 
     #[test]
     fn builds_text_only_content_array() {
@@ -973,9 +1045,9 @@ mod tests {
         let content = build_lowcode_inbound_content(&msg).unwrap();
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "(image)");
-        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["type"], "image_url");
         assert_eq!(
-            content[1]["image_url"],
+            content[1]["image_url"]["url"],
             build_wechat_cdn_download_url("abc+/=")
         );
         assert_eq!(content[1]["wechatMedia"]["mid_size"], 12);
@@ -1000,9 +1072,10 @@ mod tests {
         assert!(has_media_items(&msg));
         let content = build_lowcode_inbound_content(&msg).unwrap();
         assert_eq!(content[0]["text"], "(video)");
-        assert_eq!(content[1]["type"], "input_video");
+        assert_eq!(content[1]["type"], "file");
+        assert_eq!(content[1]["mediaType"], "video");
         assert_eq!(
-            content[1]["video_url"],
+            content[1]["file"]["url"],
             build_wechat_cdn_download_url("video-token")
         );
     }
@@ -1029,10 +1102,10 @@ mod tests {
         let content = build_lowcode_inbound_content(&msg).unwrap();
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "帮我再装一个小象萨斯");
-        assert_eq!(content[1]["type"], "input_file");
+        assert_eq!(content[1]["type"], "file");
         assert_eq!(content[1]["mediaType"], "audio");
         assert_eq!(
-            content[1]["file_url"],
+            content[1]["file"]["url"],
             build_wechat_cdn_download_url("voice-token")
         );
         assert_eq!(content[1]["wechatMedia"]["playtime"], 3760);
@@ -1067,8 +1140,10 @@ mod tests {
     #[test]
     fn marks_image_part_with_inline_transfer_metadata() {
         let part = json!({
-            "type": "input_image",
-            "image_url": "https://example.com/original.png",
+            "type": "image_url",
+            "image_url": {
+                "url": "https://example.com/original.png"
+            },
             "source": "wechat"
         });
 
@@ -1078,9 +1153,55 @@ mod tests {
             "inline_data_url",
         );
 
-        assert_eq!(updated["image_url"], "data:image/png;base64,AAAA");
+        assert_eq!(
+            updated["image_url"],
+            json!({"url": "data:image/png;base64,AAAA"})
+        );
         assert_eq!(updated["imageTransfer"], "inline_data_url");
         assert_eq!(updated["source"], "wechat");
+    }
+
+    #[test]
+    fn extracts_wechat_aes_key_from_hex_or_base64_hex() {
+        let expected: [u8; 16] = hex::decode("00112233445566778899aabbccddeeff")
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        let part = json!({
+            "wechatMedia": {
+                "aeskey": "00112233445566778899aabbccddeeff"
+            }
+        });
+        assert_eq!(extract_wechat_media_aes_key(&part).unwrap(), Some(expected));
+
+        let part = json!({
+            "wechatMedia": {
+                "media": {
+                    "aes_key": "MDAxMTIyMzM0NDU1NjY3Nzg4OTlhYWJiY2NkZGVlZmY="
+                }
+            }
+        });
+        assert_eq!(extract_wechat_media_aes_key(&part).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn decrypts_wechat_aes_ecb_ciphertext() {
+        let plaintext = b"\x89PNG\r\n\x1a\nwechat-image";
+        let key = decode_wechat_aes_key_hex("00112233445566778899aabbccddeeff").unwrap();
+        let mut buffer = plaintext.to_vec();
+        let original_len = buffer.len();
+        let block_size = 16;
+        let padded_len = ((original_len / block_size) + 1) * block_size;
+        buffer.resize(padded_len, 0);
+        let encryptor = Aes128EcbEnc::new((&key).into());
+        let ciphertext = encryptor
+            .encrypt_padded_mut::<Pkcs7>(&mut buffer, original_len)
+            .unwrap()
+            .to_vec();
+
+        let decrypted = decrypt_aes_ecb(&ciphertext, &key).unwrap();
+        assert_eq!(decrypted, plaintext);
     }
 
     #[test]

@@ -285,9 +285,51 @@ curl -X POST http://127.0.0.1:3210/outbound \
     "tenantId": "demo",
     "fromUserId": "user_xxx",
     "contextToken": "ctx_xxx",
-    "content": "hello"
+    "content": [
+      {
+        "type": "text",
+        "text": "hello"
+      }
+    ]
   }
 }
+```
+
+`data.content` 统一使用 canonical part 数组，当前微信入站按下面规则构造：
+
+- 文本：`[{ "type": "text", "text": "你好" }]`
+- 图片：先补一段可读文本，再带图片 part
+- 音频：如果微信侧已识别出文本，先放文本 part，再带音频文件 part
+- 文件/视频：统一走 `file + mediaType`
+
+图片示例：
+
+```json
+[
+  { "type": "text", "text": "(image)" },
+  {
+    "type": "image_url",
+    "image_url": { "url": "https://novac2c.cdn.weixin.qq.com/..." },
+    "mediaType": "image",
+    "source": "wechat",
+    "wechatMedia": {}
+  }
+]
+```
+
+语音示例：
+
+```json
+[
+  { "type": "text", "text": "帮我查一下订单" },
+  {
+    "type": "file",
+    "file": { "url": "https://novac2c.cdn.weixin.qq.com/..." },
+    "mediaType": "audio",
+    "source": "wechat",
+    "wechatMedia": {}
+  }
+]
 ```
 
 ## 说明

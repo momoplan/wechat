@@ -19,7 +19,9 @@
 - 当前实现基于 `https://ilinkai.weixin.qq.com/ilink/bot/*` 这条能力链路。
 - 这不是仓库内能对应到的微信公开标准开放平台 Bot API，建议先按内测/PoC 使用。
 - 当前会话模型只支持私聊：`sessionKey = wechat:dm:<user_id>`。
-- 微信用户发送命中 `runtime.command_actions` 的精确文本命令时，服务会转成 `session-control`，并把映射到的 `action` 原样发给 channel-gateway。
+- 微信用户发送命中“助手名称 + 命令文本”的精确文本命令时，服务会转成 `session-control`，并把映射到的 `action` 原样发给 channel-gateway。
+- 命令配置优先读取租户级动态配置；未配置时回退到 `runtime.command_actions` 默认值。
+- 助手名称优先读取租户级 `assistantName`；未配置时回退到 `runtime.assistant_name` 默认值。
 
 ## 架构
 
@@ -49,6 +51,7 @@ cp config.example.yaml config.yaml
 database:
   url: "mysql://root:password@127.0.0.1:3306/wechat?charset=utf8mb4"
 runtime:
+  assistant_name: "小百"
   max_inline_image_bytes: 5242880
 ```
 
@@ -70,6 +73,7 @@ cargo run
 curl -X PUT http://127.0.0.1:3211/tenants/demo \
   -H 'Content-Type: application/json' \
   -d '{
+    "assistantName":"小百",
     "gateway_url":"http://127.0.0.1:4020/channels/wechat",
     "lowcode_forward_enabled":true,
     "enabled": true
@@ -84,6 +88,7 @@ curl -X PUT http://127.0.0.1:3211/tenants/demo \
   -d '{
     "botToken":"replace-with-bot-token",
     "baseUrl":"https://ilinkai.weixin.qq.com",
+    "assistantName":"小百",
     "gateway_url":"http://127.0.0.1:4020/channels/wechat",
     "lowcode_forward_enabled":true,
     "enabled": true
@@ -138,7 +143,86 @@ curl -X POST http://127.0.0.1:3211/tenants/demo/connection/stop
 curl 'http://127.0.0.1:3211/tenants/demo/events?limit=20'
 ```
 
-### 7. external-module 兼容 API
+### 7. 动态读取或修改命令配置
+
+单独读取当前生效助手名称：
+
+```bash
+curl http://127.0.0.1:3211/tenants/demo/assistant-name
+```
+
+单独更新租户助手名称：
+
+```bash
+curl -X PUT http://127.0.0.1:3211/tenants/demo/assistant-name \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "assistantName": "小百"
+  }'
+```
+
+删除租户自定义助手名称并恢复默认：
+
+```bash
+curl -X DELETE http://127.0.0.1:3211/tenants/demo/assistant-name
+```
+
+读取当前生效命令：
+
+```bash
+curl http://127.0.0.1:3211/tenants/demo/command-actions
+```
+
+返回里会带：
+- `source=tenant`：当前使用租户自定义命令
+- `source=runtime-default`：当前回退到进程默认命令
+- `assistantName`：当前生效的助手名称
+
+租户详情接口 `GET /tenants/{tenant_id}` 返回的 `tenant.assistant_name` 也是当前生效值；如果租户没单独配置，会直接返回默认助手名称。
+
+更新租户命令：
+
+```bash
+curl -X PUT http://127.0.0.1:3211/tenants/demo/command-actions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commandActions": [
+      { "text": "新话题", "action": "new" },
+      { "text": "结束当前会话", "action": "abort" },
+      { "text": "切回订单会话", "action": "activate", "sessionId": "sess_xxx" },
+      {
+        "text": "查询积分",
+        "action": "call",
+        "service": "crm-service",
+        "method": "getPoints",
+        "params": { "scene": "wechat" }
+      }
+    ]
+  }'
+```
+
+当前支持的 action：
+- `new`：基于当前 `sessionKey` 新建并激活会话
+- `abort`：终止当前激活会话
+- `activate`：切换到指定历史 `sessionId`
+- `call`：直接调用后端 runtime action
+
+说明：
+- 用户实际发送格式为：`助手名称 + 命令文本`，例如 `小百 新话题`
+- `activate` 必须带 `sessionId`
+- `new` / `abort` 不允许带 `sessionId`
+- `call` 必须带 `service`、`method`、`params`
+- `call` 的 `params` 必须是 JSON 对象
+- `service` / `method` / `params` 只有 `action=call` 时允许提供
+- 命令仍然按整条文本精确匹配
+
+删除租户自定义命令并恢复默认：
+
+```bash
+curl -X DELETE http://127.0.0.1:3211/tenants/demo/command-actions
+```
+
+### 8. external-module 兼容 API
 
 - `POST /external-module`
 - `GET /external-module/{externalId}`
@@ -166,6 +250,8 @@ curl 'http://127.0.0.1:3211/tenants/demo/events?limit=20'
 - `outboundToken`
 - `lowcodeForwardEnabled`
 - `autoStart`
+
+命令配置不走 external-module properties，而是走上面的动态管理接口。
 
 ## 业务 API
 
@@ -240,9 +326,82 @@ curl -X POST http://127.0.0.1:3210/outbound \
     "tenantId": "demo",
     "fromUserId": "user_xxx",
     "contextToken": "ctx_xxx",
-    "content": "hello"
+    "content": [
+      {
+        "type": "text",
+        "text": "hello"
+      }
+    ]
   }
 }
+```
+
+`data.content` 统一使用 canonical part 数组，当前微信入站按下面规则构造：
+
+- 文本：`[{ "type": "text", "text": "你好" }]`
+- 图片：先补一段可读文本，再带图片 part
+- 音频：如果微信侧已识别出文本，先放文本 part，再带音频文件 part
+- 文件/视频：统一走 `file + mediaType`
+
+如果命中了 `command_actions` 配置，`data.type` 会改成 `session-control`，并透传对应 action 字段。
+
+`action=call` 时，wechat 会额外带上：
+- `data.service`
+- `data.method`
+- `data.params`
+
+示例：
+
+```json
+{
+  "type": "session-control",
+  "action": "call",
+  "source": "wechat-command",
+  "tenantId": "demo",
+  "fromUserId": "user_xxx",
+  "command": "查询积分",
+  "service": "crm-service",
+  "method": "getPoints",
+  "params": {
+    "scene": "wechat"
+  },
+  "content": [
+    {
+      "type": "text",
+      "text": "小百 查询积分"
+    }
+  ]
+}
+```
+
+图片示例：
+
+```json
+[
+  { "type": "text", "text": "(image)" },
+  {
+    "type": "image_url",
+    "image_url": { "url": "https://novac2c.cdn.weixin.qq.com/..." },
+    "mediaType": "image",
+    "source": "wechat",
+    "wechatMedia": {}
+  }
+]
+```
+
+语音示例：
+
+```json
+[
+  { "type": "text", "text": "帮我查一下订单" },
+  {
+    "type": "file",
+    "file": { "url": "https://novac2c.cdn.weixin.qq.com/..." },
+    "mediaType": "audio",
+    "source": "wechat",
+    "wechatMedia": {}
+  }
+]
 ```
 
 ## 说明

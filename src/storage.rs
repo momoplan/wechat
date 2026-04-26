@@ -33,7 +33,7 @@ impl TenantStore {
 
     pub async fn list_tenants(&self) -> Result<Vec<PersistedTenant>> {
         let rows = sqlx::query(
-            "SELECT tenant_id, workspace_id, bot_token, api_base_url, account_id, user_id, sync_buf, lowcode_ws_base_url, lowcode_ws_token, outbound_token, lowcode_forward_enabled, enabled FROM wechat_tenant_credentials ORDER BY tenant_id ASC",
+            "SELECT tenant_id, bot_token, api_base_url, account_id, user_id, sync_buf, lowcode_ws_base_url, lowcode_ws_token, outbound_token, lowcode_forward_enabled, enabled, assistant_name, command_actions_json FROM wechat_tenant_credentials ORDER BY tenant_id ASC",
         )
         .fetch_all(&self.pool)
         .await
@@ -44,7 +44,6 @@ impl TenantStore {
             out.push(PersistedTenant {
                 tenant_id: row.get("tenant_id"),
                 credential: TenantCredential {
-                    workspace_id: row.get("workspace_id"),
                     bot_token: row.get("bot_token"),
                     api_base_url: row.get("api_base_url"),
                     account_id: row.get("account_id"),
@@ -55,6 +54,8 @@ impl TenantStore {
                     outbound_token: row.get("outbound_token"),
                     lowcode_forward_enabled: row.get("lowcode_forward_enabled"),
                     enabled: row.get("enabled"),
+                    assistant_name: row.get("assistant_name"),
+                    command_actions: parse_command_actions_json(row.get("command_actions_json"))?,
                 },
             });
         }
@@ -69,11 +70,10 @@ impl TenantStore {
         sqlx::query(
             r#"
             INSERT INTO wechat_tenant_credentials (
-              tenant_id, workspace_id, bot_token, api_base_url, account_id, user_id, sync_buf, lowcode_ws_base_url, lowcode_ws_token, outbound_token, lowcode_forward_enabled, enabled
+              tenant_id, bot_token, api_base_url, account_id, user_id, sync_buf, lowcode_ws_base_url, lowcode_ws_token, outbound_token, lowcode_forward_enabled, enabled, assistant_name, command_actions_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON DUPLICATE KEY UPDATE
-              workspace_id = VALUES(workspace_id),
               bot_token = VALUES(bot_token),
               api_base_url = VALUES(api_base_url),
               account_id = VALUES(account_id),
@@ -84,11 +84,12 @@ impl TenantStore {
               outbound_token = VALUES(outbound_token),
               lowcode_forward_enabled = VALUES(lowcode_forward_enabled),
               enabled = VALUES(enabled),
+              assistant_name = VALUES(assistant_name),
+              command_actions_json = VALUES(command_actions_json),
               updated_at = CURRENT_TIMESTAMP
             "#,
         )
         .bind(tenant_id)
-        .bind(credential.workspace_id.as_deref())
         .bind(credential.bot_token.as_deref())
         .bind(credential.api_base_url.as_deref())
         .bind(credential.account_id.as_deref())
@@ -99,18 +100,11 @@ impl TenantStore {
         .bind(credential.outbound_token.as_deref())
         .bind(credential.lowcode_forward_enabled)
         .bind(credential.enabled.unwrap_or(true))
+        .bind(credential.assistant_name.as_deref())
+        .bind(serialize_command_actions_json(credential.command_actions.as_deref())?)
         .execute(&self.pool)
         .await
         .context("写入 wechat_tenant_credentials 失败")?;
-        Ok(())
-    }
-
-    pub async fn delete_tenant(&self, tenant_id: &str) -> Result<()> {
-        sqlx::query("DELETE FROM wechat_tenant_credentials WHERE tenant_id = ?")
-            .bind(tenant_id)
-            .execute(&self.pool)
-            .await
-            .context("删除 wechat_tenant_credentials 失败")?;
         Ok(())
     }
 
@@ -143,7 +137,6 @@ impl TenantStore {
             r#"
             CREATE TABLE IF NOT EXISTS wechat_tenant_credentials (
               tenant_id VARCHAR(128) PRIMARY KEY,
-              workspace_id VARCHAR(128) NULL,
               bot_token VARCHAR(255) NULL,
               api_base_url VARCHAR(512) NULL,
               account_id VARCHAR(255) NULL,
@@ -154,6 +147,8 @@ impl TenantStore {
               outbound_token VARCHAR(255) NULL,
               lowcode_forward_enabled TINYINT(1) NULL,
               enabled TINYINT(1) NOT NULL DEFAULT 1,
+              assistant_name VARCHAR(64) NULL,
+              command_actions_json TEXT NULL,
               updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             "#,
@@ -162,11 +157,6 @@ impl TenantStore {
         .await
         .context("初始化 wechat_tenant_credentials 表失败")?;
 
-        self.add_column_if_missing(
-            "ALTER TABLE wechat_tenant_credentials ADD COLUMN workspace_id VARCHAR(128) NULL",
-            "workspace_id",
-        )
-        .await?;
         self.add_column_if_missing(
             "ALTER TABLE wechat_tenant_credentials ADD COLUMN bot_token VARCHAR(255) NULL",
             "bot_token",
@@ -217,6 +207,16 @@ impl TenantStore {
             "enabled",
         )
         .await?;
+        self.add_column_if_missing(
+            "ALTER TABLE wechat_tenant_credentials ADD COLUMN assistant_name VARCHAR(64) NULL",
+            "assistant_name",
+        )
+        .await?;
+        self.add_column_if_missing(
+            "ALTER TABLE wechat_tenant_credentials ADD COLUMN command_actions_json TEXT NULL",
+            "command_actions_json",
+        )
+        .await?;
         Ok(())
     }
 
@@ -237,5 +237,34 @@ impl TenantStore {
                 }
             }
         }
+    }
+}
+
+fn serialize_command_actions_json(
+    command_actions: Option<&[crate::config::CommandActionConfig]>,
+) -> Result<Option<String>> {
+    match command_actions {
+        Some(items) if !items.is_empty() => serde_json::to_string(items)
+            .map(Some)
+            .context("序列化 command_actions_json 失败"),
+        _ => Ok(None),
+    }
+}
+
+fn parse_command_actions_json(
+    raw: Option<String>,
+) -> Result<Option<Vec<crate::config::CommandActionConfig>>> {
+    let Some(raw) = raw
+        .map(|item| item.trim().to_string())
+        .filter(|item| !item.is_empty())
+    else {
+        return Ok(None);
+    };
+    let parsed = serde_json::from_str::<Vec<crate::config::CommandActionConfig>>(&raw)
+        .with_context(|| format!("解析 command_actions_json 失败: {raw}"))?;
+    if parsed.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(parsed))
     }
 }

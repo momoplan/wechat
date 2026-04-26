@@ -131,7 +131,6 @@ impl TenantContext {
         let logged_in = credential.is_logged_in();
         TenantSummary {
             tenant_id: self.tenant_id.clone(),
-            workspace_id: credential.workspace_id,
             logged_in,
             bot_token_masked: credential.bot_token.as_deref().map(mask_secret),
             api_base_url: credential.api_base_url,
@@ -140,6 +139,12 @@ impl TenantContext {
             lowcode_ws_base_url: credential.lowcode_ws_base_url,
             lowcode_forward_enabled: credential.lowcode_forward_enabled,
             enabled,
+            assistant_name: credential.assistant_name,
+            command_actions_configured: credential
+                .command_actions
+                .as_ref()
+                .map(|items| !items.is_empty())
+                .unwrap_or(false),
             connection,
         }
     }
@@ -312,7 +317,11 @@ impl AppState {
     pub async fn list_tenants(&self) -> Vec<TenantSummary> {
         let mut out = Vec::with_capacity(self.tenants.len());
         for item in &self.tenants {
-            out.push(item.value().summary().await);
+            let mut summary = item.value().summary().await;
+            if summary.assistant_name.is_none() {
+                summary.assistant_name = Some(self.config.runtime.assistant_name.clone());
+            }
+            out.push(summary);
         }
         out.sort_by(|a, b| a.tenant_id.cmp(&b.tenant_id));
         out
@@ -358,12 +367,15 @@ impl AppState {
         &self,
         tenant_id: &str,
     ) -> Result<Option<Arc<TenantContext>>, ServiceError> {
-        if !self.tenants.contains_key(tenant_id) {
+        let Some(tenant) = self.get_tenant(tenant_id) else {
             return Ok(None);
-        }
-
-        self.tenant_store.delete_tenant(tenant_id).await?;
-        Ok(self.tenants.remove(tenant_id).map(|(_, value)| value))
+        };
+        self.tenant_store.update_enabled(tenant_id, false).await?;
+        let mut credential = tenant.credential.read().await.clone();
+        credential.enabled = Some(false);
+        tenant.update_credential(credential).await;
+        tenant.mark_disabled().await;
+        Ok(Some(tenant))
     }
 
     pub async fn set_tenant_enabled(

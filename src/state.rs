@@ -139,6 +139,7 @@ impl TenantContext {
             lowcode_ws_base_url: credential.lowcode_ws_base_url,
             lowcode_forward_enabled: credential.lowcode_forward_enabled,
             enabled,
+            assistant_name: credential.assistant_name,
             command_actions_configured: credential
                 .command_actions
                 .as_ref()
@@ -316,7 +317,11 @@ impl AppState {
     pub async fn list_tenants(&self) -> Vec<TenantSummary> {
         let mut out = Vec::with_capacity(self.tenants.len());
         for item in &self.tenants {
-            out.push(item.value().summary().await);
+            let mut summary = item.value().summary().await;
+            if summary.assistant_name.is_none() {
+                summary.assistant_name = Some(self.config.runtime.assistant_name.clone());
+            }
+            out.push(summary);
         }
         out.sort_by(|a, b| a.tenant_id.cmp(&b.tenant_id));
         out

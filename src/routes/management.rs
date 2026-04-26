@@ -42,10 +42,25 @@ struct CommandActionsUpdateRequest {
     command_actions: Vec<CommandActionConfig>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AssistantNameUpdateRequest {
+    assistant_name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AssistantNameResponse {
+    tenant_id: String,
+    assistant_name: String,
+    source: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CommandActionsResponse {
     tenant_id: String,
+    assistant_name: String,
     command_actions: Vec<CommandActionConfig>,
     source: String,
 }
@@ -59,6 +74,18 @@ pub fn scope() -> Scope {
         .route("/tenants/{tenant_id}", web::get().to(get_tenant))
         .route("/tenants/{tenant_id}", web::put().to(upsert_tenant))
         .route("/tenants/{tenant_id}", web::delete().to(delete_tenant))
+        .route(
+            "/tenants/{tenant_id}/assistant-name",
+            web::get().to(get_assistant_name),
+        )
+        .route(
+            "/tenants/{tenant_id}/assistant-name",
+            web::put().to(update_assistant_name),
+        )
+        .route(
+            "/tenants/{tenant_id}/assistant-name",
+            web::delete().to(delete_assistant_name),
+        )
         .route(
             "/tenants/{tenant_id}/command-actions",
             web::get().to(get_command_actions),
@@ -112,7 +139,9 @@ async fn get_tenant(
         .ok_or_else(|| ServiceError::NotFound(format!("租户不存在: {tenant_id}")))?;
     tenant.prune_finished_worker().await;
     tenant.prune_finished_login_worker().await;
-    Ok(HttpResponse::Ok().json(tenant.summary().await))
+    Ok(HttpResponse::Ok().json(
+        tenant_summary_with_default_name(state.get_ref(), &tenant).await,
+    ))
 }
 
 async fn upsert_tenant(
@@ -144,7 +173,7 @@ async fn upsert_tenant(
         let _ = start_worker_internal(state.get_ref().clone(), tenant.clone()).await;
     }
 
-    let summary: TenantSummary = tenant.summary().await;
+    let summary: TenantSummary = tenant_summary_with_default_name(state.get_ref(), &tenant).await;
     Ok(HttpResponse::Ok().json(json!({
         "created": created,
         "enabled": summary.enabled,
@@ -171,6 +200,72 @@ async fn delete_tenant(
     })))
 }
 
+async fn get_assistant_name(
+    path: web::Path<String>,
+    state: web::Data<Arc<AppState>>,
+) -> Result<HttpResponse, ServiceError> {
+    let tenant_id = path.into_inner();
+    let tenant = state
+        .get_tenant(&tenant_id)
+        .ok_or_else(|| ServiceError::NotFound(format!("租户不存在: {tenant_id}")))?;
+    let configured = tenant.credential.read().await.assistant_name.clone();
+    let (assistant_name, source) = match configured {
+        Some(name) => (name, "tenant"),
+        None => (state.config.runtime.assistant_name.clone(), "runtime-default"),
+    };
+    Ok(HttpResponse::Ok().json(AssistantNameResponse {
+        tenant_id,
+        assistant_name,
+        source: source.to_string(),
+    }))
+}
+
+async fn update_assistant_name(
+    path: web::Path<String>,
+    state: web::Data<Arc<AppState>>,
+    payload: web::Json<AssistantNameUpdateRequest>,
+) -> Result<HttpResponse, ServiceError> {
+    let tenant_id = path.into_inner();
+    let tenant = state
+        .get_tenant(&tenant_id)
+        .ok_or_else(|| ServiceError::NotFound(format!("租户不存在: {tenant_id}")))?;
+    let assistant_name = normalize_required_text(payload.into_inner().assistant_name, "助手名称不能为空")?;
+    let mut credential = tenant.credential.read().await.clone();
+    credential.assistant_name = Some(assistant_name.clone());
+    state
+        .tenant_store
+        .upsert_tenant(&tenant_id, &credential)
+        .await?;
+    tenant.update_credential(credential).await;
+    Ok(HttpResponse::Ok().json(AssistantNameResponse {
+        tenant_id,
+        assistant_name,
+        source: "tenant".to_string(),
+    }))
+}
+
+async fn delete_assistant_name(
+    path: web::Path<String>,
+    state: web::Data<Arc<AppState>>,
+) -> Result<HttpResponse, ServiceError> {
+    let tenant_id = path.into_inner();
+    let tenant = state
+        .get_tenant(&tenant_id)
+        .ok_or_else(|| ServiceError::NotFound(format!("租户不存在: {tenant_id}")))?;
+    let mut credential = tenant.credential.read().await.clone();
+    credential.assistant_name = None;
+    state
+        .tenant_store
+        .upsert_tenant(&tenant_id, &credential)
+        .await?;
+    tenant.update_credential(credential).await;
+    Ok(HttpResponse::Ok().json(AssistantNameResponse {
+        tenant_id,
+        assistant_name: state.config.runtime.assistant_name.clone(),
+        source: "runtime-default".to_string(),
+    }))
+}
+
 async fn get_command_actions(
     path: web::Path<String>,
     state: web::Data<Arc<AppState>>,
@@ -180,6 +275,13 @@ async fn get_command_actions(
         .get_tenant(&tenant_id)
         .ok_or_else(|| ServiceError::NotFound(format!("租户不存在: {tenant_id}")))?;
     let configured = tenant.credential.read().await.command_actions.clone();
+    let assistant_name = tenant
+        .credential
+        .read()
+        .await
+        .assistant_name
+        .clone()
+        .unwrap_or_else(|| state.config.runtime.assistant_name.clone());
     let (command_actions, source) = match configured {
         Some(items) => (items, "tenant"),
         None => (
@@ -189,6 +291,7 @@ async fn get_command_actions(
     };
     Ok(HttpResponse::Ok().json(CommandActionsResponse {
         tenant_id,
+        assistant_name,
         command_actions,
         source: source.to_string(),
     }))
@@ -213,6 +316,13 @@ async fn update_command_actions(
     tenant.update_credential(credential).await;
     Ok(HttpResponse::Ok().json(CommandActionsResponse {
         tenant_id,
+        assistant_name: tenant
+            .credential
+            .read()
+            .await
+            .assistant_name
+            .clone()
+            .unwrap_or_else(|| state.config.runtime.assistant_name.clone()),
         command_actions,
         source: "tenant".to_string(),
     }))
@@ -235,6 +345,13 @@ async fn delete_command_actions(
     tenant.update_credential(credential).await;
     Ok(HttpResponse::Ok().json(CommandActionsResponse {
         tenant_id,
+        assistant_name: tenant
+            .credential
+            .read()
+            .await
+            .assistant_name
+            .clone()
+            .unwrap_or_else(|| state.config.runtime.assistant_name.clone()),
         command_actions: state.config.runtime.command_actions.clone(),
         source: "runtime-default".to_string(),
     }))
@@ -256,7 +373,7 @@ async fn start_connection(
     Ok(HttpResponse::Ok().json(json!({
         "started": logged_in,
         "login_required": !logged_in,
-        "tenant": tenant.summary().await
+        "tenant": tenant_summary_with_default_name(state.get_ref(), &tenant).await
     })))
 }
 
@@ -270,7 +387,7 @@ async fn stop_connection(
 
     Ok(HttpResponse::Ok().json(json!({
         "stopped": stopped,
-        "tenant": tenant.summary().await
+        "tenant": tenant_summary_with_default_name(state.get_ref(), &tenant).await
     })))
 }
 
@@ -416,7 +533,9 @@ async fn check_login_status(
                 "last_error": current_session.last_error
             });
             if current_session.confirmed {
-                body["tenant"] = serde_json::to_value(tenant.summary().await)
+                body["tenant"] = serde_json::to_value(
+                    tenant_summary_with_default_name(state.get_ref(), &tenant).await,
+                )
                     .map_err(|err| ServiceError::Internal(format!("序列化租户状态失败: {err}")))?;
             }
             return Ok(HttpResponse::Ok().json(body));
@@ -443,7 +562,9 @@ async fn check_login_status(
             "last_error": session.last_error
         });
         if session.confirmed {
-            body["tenant"] = serde_json::to_value(tenant.summary().await)
+            body["tenant"] = serde_json::to_value(
+                tenant_summary_with_default_name(state.get_ref(), &tenant).await,
+            )
                 .map_err(|err| ServiceError::Internal(format!("序列化租户状态失败: {err}")))?;
         }
         return Ok(HttpResponse::Ok().json(body));
@@ -520,7 +641,7 @@ async fn check_login_status(
             "status": response.status,
             "confirmed": true,
             "server_polling": false,
-            "tenant": tenant.summary().await
+            "tenant": tenant_summary_with_default_name(state.get_ref(), &tenant).await
         })));
     }
 
@@ -558,6 +679,7 @@ pub(crate) fn normalize_credential(credential: &mut TenantCredential) -> Result<
     credential.lowcode_ws_base_url = normalize_optional(credential.lowcode_ws_base_url.take());
     credential.lowcode_ws_token = normalize_optional(credential.lowcode_ws_token.take());
     credential.outbound_token = normalize_optional(credential.outbound_token.take());
+    credential.assistant_name = normalize_optional(credential.assistant_name.take());
     credential.command_actions =
         normalize_optional_command_actions(credential.command_actions.take())?;
     credential.ensure_outbound_token();
@@ -597,12 +719,16 @@ fn normalize_command_actions(
                 "命令 {text} 的 action 不能为空"
             )));
         }
-        if !matches!(action.as_str(), "new" | "abort" | "activate") {
+        if !matches!(action.as_str(), "new" | "abort" | "activate" | "call") {
             return Err(ServiceError::BadRequest(format!(
-                "命令 {text} 的 action 不支持，当前只允许 new、abort、activate"
+                "命令 {text} 的 action 不支持，当前只允许 new、abort、activate、call"
             )));
         }
         let session_id = normalize_optional(item.session_id);
+        let service = normalize_optional(item.service);
+        let method = normalize_optional(item.method);
+        let params = item.params.filter(|value| !value.is_null());
+
         if action == "activate" && session_id.is_none() {
             return Err(ServiceError::BadRequest(format!(
                 "命令 {text} 使用 activate 时必须提供 sessionId"
@@ -613,10 +739,48 @@ fn normalize_command_actions(
                 "命令 {text} 只有 action=activate 时才允许提供 sessionId"
             )));
         }
+        if action == "call" && service.is_none() {
+            return Err(ServiceError::BadRequest(format!(
+                "命令 {text} 使用 call 时必须提供 service"
+            )));
+        }
+        if action == "call" && method.is_none() {
+            return Err(ServiceError::BadRequest(format!(
+                "命令 {text} 使用 call 时必须提供 method"
+            )));
+        }
+        if action == "call" && params.is_none() {
+            return Err(ServiceError::BadRequest(format!(
+                "命令 {text} 使用 call 时必须提供 params"
+            )));
+        }
+        if action == "call" && !params.as_ref().is_some_and(Value::is_object) {
+            return Err(ServiceError::BadRequest(format!(
+                "命令 {text} 使用 call 时 params 必须是对象"
+            )));
+        }
+        if action != "call" && service.is_some() {
+            return Err(ServiceError::BadRequest(format!(
+                "命令 {text} 只有 action=call 时才允许提供 service"
+            )));
+        }
+        if action != "call" && method.is_some() {
+            return Err(ServiceError::BadRequest(format!(
+                "命令 {text} 只有 action=call 时才允许提供 method"
+            )));
+        }
+        if action != "call" && params.is_some() {
+            return Err(ServiceError::BadRequest(format!(
+                "命令 {text} 只有 action=call 时才允许提供 params"
+            )));
+        }
         out.push(CommandActionConfig {
             text,
             action,
             session_id,
+            service,
+            method,
+            params,
         });
     }
     if out.is_empty() {
@@ -631,6 +795,21 @@ pub(crate) fn normalize_optional(value: Option<String>) -> Option<String> {
     value
         .map(|item| item.trim().to_string())
         .filter(|item| !item.is_empty())
+}
+
+fn normalize_required_text(value: String, message: &str) -> Result<String, ServiceError> {
+    normalize_optional(Some(value)).ok_or_else(|| ServiceError::BadRequest(message.to_string()))
+}
+
+async fn tenant_summary_with_default_name(
+    state: &Arc<AppState>,
+    tenant: &Arc<crate::state::TenantContext>,
+) -> TenantSummary {
+    let mut summary = tenant.summary().await;
+    if summary.assistant_name.is_none() {
+        summary.assistant_name = Some(state.config.runtime.assistant_name.clone());
+    }
+    summary
 }
 
 pub(crate) fn merge_properties(

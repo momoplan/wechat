@@ -389,6 +389,7 @@ fn build_credential(
                 .or_else(|| existing.map(|value| value.is_enabled()))
                 .unwrap_or(enabled_default),
         ),
+        assistant_name: existing.and_then(|value| value.assistant_name.clone()),
         command_actions: existing.and_then(|value| value.command_actions.clone()),
     })
 }
@@ -754,6 +755,7 @@ mod tests {
             lowcode_ws_base_url: Some("https://example.com/inbound".to_string()),
             lowcode_forward_enabled: Some(true),
             enabled: true,
+            assistant_name: Some("小百".to_string()),
             command_actions_configured: false,
             connection: crate::models::ConnectionStatus::default(),
         };
@@ -768,6 +770,7 @@ mod tests {
             outbound_token: Some("outbound-token".to_string()),
             lowcode_forward_enabled: summary.lowcode_forward_enabled,
             enabled: Some(true),
+            assistant_name: summary.assistant_name.clone(),
             command_actions: None,
         };
 

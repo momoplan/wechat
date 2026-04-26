@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,11 +42,13 @@ pub struct RuntimeConfig {
     pub poll_timeout_seconds: u64,
     #[serde(default = "default_max_inline_image_bytes")]
     pub max_inline_image_bytes: usize,
+    #[serde(default = "default_assistant_name")]
+    pub assistant_name: String,
     #[serde(default = "default_command_actions")]
     pub command_actions: Vec<CommandActionConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CommandActionConfig {
     #[serde(default, alias = "command")]
     pub text: String,
@@ -53,6 +56,12 @@ pub struct CommandActionConfig {
     pub action: String,
     #[serde(default, alias = "sessionId", alias = "targetSessionId")]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub service: Option<String>,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub params: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,17 +150,27 @@ fn default_max_inline_image_bytes() -> usize {
     5 * 1024 * 1024
 }
 
+fn default_assistant_name() -> String {
+    "小百".to_string()
+}
+
 fn default_command_actions() -> Vec<CommandActionConfig> {
     vec![
         CommandActionConfig {
-            text: "/new".to_string(),
+            text: "新话题".to_string(),
             action: "new".to_string(),
             session_id: None,
+            service: None,
+            method: None,
+            params: None,
         },
         CommandActionConfig {
-            text: "/新话题".to_string(),
-            action: "new".to_string(),
+            text: "结束当前会话".to_string(),
+            action: "abort".to_string(),
             session_id: None,
+            service: None,
+            method: None,
+            params: None,
         },
     ]
 }
@@ -204,6 +223,7 @@ impl Default for AppConfig {
                 poll_retry_seconds: default_poll_retry_seconds(),
                 poll_timeout_seconds: default_poll_timeout_seconds(),
                 max_inline_image_bytes: default_max_inline_image_bytes(),
+                assistant_name: default_assistant_name(),
                 command_actions: default_command_actions(),
             },
             database: DatabaseConfig::default(),
@@ -221,7 +241,7 @@ impl Default for AppConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandActionConfig, RuntimeConfig, default_command_actions};
+    use super::{CommandActionConfig, RuntimeConfig, default_assistant_name, default_command_actions};
 
     #[test]
     fn runtime_defaults_include_default_command_actions() {
@@ -230,21 +250,29 @@ mod tests {
             poll_retry_seconds: 3,
             poll_timeout_seconds: 35,
             max_inline_image_bytes: 1024,
+            assistant_name: default_assistant_name(),
             command_actions: default_command_actions(),
         };
 
+        assert_eq!(runtime.assistant_name, "小百");
         assert_eq!(
             runtime.command_actions,
             vec![
                 CommandActionConfig {
-                    text: "/new".to_string(),
+                    text: "新话题".to_string(),
                     action: "new".to_string(),
                     session_id: None,
+                    service: None,
+                    method: None,
+                    params: None,
                 },
                 CommandActionConfig {
-                    text: "/新话题".to_string(),
-                    action: "new".to_string(),
+                    text: "结束当前会话".to_string(),
+                    action: "abort".to_string(),
                     session_id: None,
+                    service: None,
+                    method: None,
+                    params: None,
                 }
             ]
         );

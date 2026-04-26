@@ -33,6 +33,8 @@ pub struct TenantCredential {
     pub lowcode_forward_enabled: Option<bool>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default, alias = "assistantName")]
+    pub assistant_name: Option<String>,
     #[serde(default, alias = "commandActions")]
     pub command_actions: Option<Vec<CommandActionConfig>>,
 }
@@ -78,6 +80,7 @@ pub struct TenantSummary {
     pub lowcode_ws_base_url: Option<String>,
     pub lowcode_forward_enabled: Option<bool>,
     pub enabled: bool,
+    pub assistant_name: Option<String>,
     pub command_actions_configured: bool,
     pub connection: ConnectionStatus,
 }

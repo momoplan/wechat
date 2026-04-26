@@ -25,6 +25,9 @@ struct InboundCommand {
     text: String,
     action: String,
     session_id: Option<String>,
+    service: Option<String>,
+    method: Option<String>,
+    params: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,8 +199,20 @@ async fn handle_inbound_message(state: &Arc<AppState>, tenant: &Arc<TenantContex
         .command_actions
         .clone()
         .unwrap_or_else(|| state.config.runtime.command_actions.clone());
-    let inbound_command =
-        detect_inbound_command(message_type, &content, has_media, &command_actions);
+    let assistant_name = tenant
+        .credential
+        .read()
+        .await
+        .assistant_name
+        .clone()
+        .unwrap_or_else(|| state.config.runtime.assistant_name.clone());
+    let inbound_command = detect_inbound_command(
+        message_type,
+        &content,
+        has_media,
+        assistant_name.as_str(),
+        &command_actions,
+    );
     if message_type != Some(1) && !has_media {
         info!(
             tenant_id = %tenant.tenant_id,
@@ -298,19 +313,24 @@ fn detect_inbound_command(
     message_type: Option<i64>,
     content: &str,
     has_media: bool,
+    assistant_name: &str,
     command_actions: &[CommandActionConfig],
 ) -> Option<InboundCommand> {
     if message_type != Some(1) || has_media {
         return None;
     }
 
-    let text = normalize_command_text(content)?;
+    let assistant_name = normalize_assistant_name(assistant_name)?;
+    let text = normalize_command_text(content, &assistant_name)?;
     command_actions.iter().find_map(|item| {
         if text.eq_ignore_ascii_case(item.text.as_str()) {
             Some(InboundCommand {
                 text: text.clone(),
                 action: item.action.clone(),
                 session_id: item.session_id.clone(),
+                service: item.service.clone(),
+                method: item.method.clone(),
+                params: item.params.clone(),
             })
         } else {
             None
@@ -318,12 +338,30 @@ fn detect_inbound_command(
     })
 }
 
-fn normalize_command_text(text: &str) -> Option<String> {
-    let trimmed = text.trim();
+fn normalize_assistant_name(name: &str) -> Option<String> {
+    let trimmed = name.trim();
     if trimmed.is_empty() {
         None
     } else {
         Some(trimmed.to_string())
+    }
+}
+
+fn normalize_command_text(text: &str, assistant_name: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let without_prefix = trimmed.strip_prefix(assistant_name)?;
+    let command = without_prefix
+        .trim_start_matches(|ch: char| ch.is_whitespace() || matches!(ch, ',' | '，' | ':' | '：'))
+        .trim();
+
+    if command.is_empty() {
+        None
+    } else {
+        Some(command.to_string())
     }
 }
 
@@ -741,7 +779,7 @@ async fn maybe_forward_to_lowcode_agent(
                 command = %command.text,
                 "识别到会话控制命令，改发 session-control"
             );
-            json!({
+            let mut payload = json!({
                 "type": "session-control",
                 "action": command.action,
                 "source": "wechat-command",
@@ -751,7 +789,19 @@ async fn maybe_forward_to_lowcode_agent(
                 "command": command.text,
                 "sessionId": command.session_id,
                 "content": content
-            })
+            });
+            if let Some(obj) = payload.as_object_mut() {
+                if let Some(service) = command.service.as_ref() {
+                    obj.insert("service".to_string(), json!(service));
+                }
+                if let Some(method) = command.method.as_ref() {
+                    obj.insert("method".to_string(), json!(method));
+                }
+                if let Some(params) = command.params.as_ref() {
+                    obj.insert("params".to_string(), params.clone());
+                }
+            }
+            payload
         }
         None => json!({
             "type": "input",
@@ -988,8 +1038,8 @@ mod tests {
         InboundCommand, SessionControlSuccess, build_lowcode_inbound_content,
         build_wechat_cdn_download_url, decode_wechat_aes_key_hex, decrypt_aes_ecb,
         detect_inbound_command, extract_session_control_success, extract_wechat_media_aes_key,
-        guess_image_mime_type, has_media_items, mark_image_part_transfer,
-        normalize_image_content_type, session_control_success_reply_text,
+        guess_image_mime_type, has_media_items, mark_image_part_transfer, normalize_assistant_name,
+        normalize_command_text, normalize_image_content_type, session_control_success_reply_text,
     };
     use aes::Aes128;
     use aes::cipher::{BlockEncryptMut, KeyInit, block_padding::Pkcs7};
@@ -1208,30 +1258,42 @@ mod tests {
     fn detects_new_session_command_from_text_message() {
         let commands = vec![
             CommandActionConfig {
-                text: "/new".to_string(),
+                text: "新话题".to_string(),
                 action: "new".to_string(),
                 session_id: None,
+                service: None,
+                method: None,
+                params: None,
             },
             CommandActionConfig {
-                text: "/新话题".to_string(),
+                text: "开始新话题".to_string(),
                 action: "new".to_string(),
                 session_id: None,
+                service: None,
+                method: None,
+                params: None,
             },
         ];
         assert_eq!(
-            detect_inbound_command(Some(1), "/new", false, &commands),
+            detect_inbound_command(Some(1), "小百 新话题", false, "小百", &commands),
             Some(InboundCommand {
-                text: "/new".to_string(),
+                text: "新话题".to_string(),
                 action: "new".to_string(),
                 session_id: None,
+                service: None,
+                method: None,
+                params: None,
             })
         );
         assert_eq!(
-            detect_inbound_command(Some(1), " /新话题 ", false, &commands),
+            detect_inbound_command(Some(1), " 小百，新话题 ", false, "小百", &commands),
             Some(InboundCommand {
-                text: "/新话题".to_string(),
+                text: "新话题".to_string(),
                 action: "new".to_string(),
                 session_id: None,
+                service: None,
+                method: None,
+                params: None,
             })
         );
     }
@@ -1240,22 +1302,28 @@ mod tests {
     fn ignores_non_command_or_non_text_messages() {
         let commands = vec![
             CommandActionConfig {
-                text: "/new".to_string(),
+                text: "新话题".to_string(),
                 action: "new".to_string(),
                 session_id: None,
+                service: None,
+                method: None,
+                params: None,
             },
             CommandActionConfig {
-                text: "/新话题".to_string(),
-                action: "new".to_string(),
+                text: "结束当前会话".to_string(),
+                action: "abort".to_string(),
                 session_id: None,
+                service: None,
+                method: None,
+                params: None,
             },
         ];
         assert_eq!(
-            detect_inbound_command(Some(1), "/new 帮我总结一下", false, &commands),
+            detect_inbound_command(Some(1), "小百 新话题 帮我总结一下", false, "小百", &commands),
             None
         );
         assert_eq!(
-            detect_inbound_command(Some(2), "/new", true, &commands),
+            detect_inbound_command(Some(2), "小百 新话题", true, "小百", &commands),
             None
         );
     }
@@ -1263,20 +1331,26 @@ mod tests {
     #[test]
     fn detects_custom_configured_new_session_command() {
         let commands = vec![CommandActionConfig {
-            text: "/reset".to_string(),
-            action: "new".to_string(),
-            session_id: None,
-        }];
-        assert_eq!(
-            detect_inbound_command(Some(1), " /reset ", false, &commands),
-            Some(InboundCommand {
-                text: "/reset".to_string(),
+                text: "重置话题".to_string(),
                 action: "new".to_string(),
                 session_id: None,
+                service: None,
+                method: None,
+                params: None,
+            }];
+        assert_eq!(
+            detect_inbound_command(Some(1), " 小百 重置话题 ", false, "小百", &commands),
+            Some(InboundCommand {
+                text: "重置话题".to_string(),
+                action: "new".to_string(),
+                session_id: None,
+                service: None,
+                method: None,
+                params: None,
             })
         );
         assert_eq!(
-            detect_inbound_command(Some(1), "/new", false, &commands),
+            detect_inbound_command(Some(1), "小百 新话题", false, "小百", &commands),
             None
         );
     }
@@ -1284,16 +1358,22 @@ mod tests {
     #[test]
     fn detects_custom_configured_abort_command() {
         let commands = vec![CommandActionConfig {
-            text: "/结束".to_string(),
+            text: "结束当前会话".to_string(),
             action: "abort".to_string(),
             session_id: None,
+            service: None,
+            method: None,
+            params: None,
         }];
         assert_eq!(
-            detect_inbound_command(Some(1), "/结束", false, &commands),
+            detect_inbound_command(Some(1), "小百 结束当前会话", false, "小百", &commands),
             Some(InboundCommand {
-                text: "/结束".to_string(),
+                text: "结束当前会话".to_string(),
                 action: "abort".to_string(),
                 session_id: None,
+                service: None,
+                method: None,
+                params: None,
             })
         );
     }
@@ -1301,18 +1381,66 @@ mod tests {
     #[test]
     fn detects_custom_configured_activate_command() {
         let commands = vec![CommandActionConfig {
-            text: "/切回订单会话".to_string(),
+            text: "切回订单会话".to_string(),
             action: "activate".to_string(),
             session_id: Some("sess_order_123".to_string()),
+            service: None,
+            method: None,
+            params: None,
         }];
         assert_eq!(
-            detect_inbound_command(Some(1), "/切回订单会话", false, &commands),
+            detect_inbound_command(Some(1), "小百切回订单会话", false, "小百", &commands),
             Some(InboundCommand {
-                text: "/切回订单会话".to_string(),
+                text: "切回订单会话".to_string(),
                 action: "activate".to_string(),
                 session_id: Some("sess_order_123".to_string()),
+                service: None,
+                method: None,
+                params: None,
             })
         );
+    }
+
+    #[test]
+    fn detects_custom_configured_call_command() {
+        let commands = vec![CommandActionConfig {
+            text: "查询积分".to_string(),
+            action: "call".to_string(),
+            session_id: None,
+            service: Some("crm-service".to_string()),
+            method: Some("getPoints".to_string()),
+            params: Some(json!({
+                "scene": "wechat"
+            })),
+        }];
+        assert_eq!(
+            detect_inbound_command(Some(1), "小百：查询积分", false, "小百", &commands),
+            Some(InboundCommand {
+                text: "查询积分".to_string(),
+                action: "call".to_string(),
+                session_id: None,
+                service: Some("crm-service".to_string()),
+                method: Some("getPoints".to_string()),
+                params: Some(json!({
+                    "scene": "wechat"
+                })),
+            })
+        );
+    }
+
+    #[test]
+    fn normalizes_assistant_prefixed_command_text() {
+        assert_eq!(normalize_assistant_name(" 小百 "), Some("小百".to_string()));
+        assert_eq!(
+            normalize_command_text("小百：新话题", "小百"),
+            Some("新话题".to_string())
+        );
+        assert_eq!(
+            normalize_command_text("小百新话题", "小百"),
+            Some("新话题".to_string())
+        );
+        assert_eq!(normalize_command_text("新话题", "小百"), None);
+        assert_eq!(normalize_command_text("小百", "小百"), None);
     }
 
     #[test]

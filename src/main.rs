@@ -1,3 +1,4 @@
+mod channel_session_client;
 mod config;
 mod error;
 mod logging;

@@ -139,9 +139,7 @@ async fn get_tenant(
         .ok_or_else(|| ServiceError::NotFound(format!("租户不存在: {tenant_id}")))?;
     tenant.prune_finished_worker().await;
     tenant.prune_finished_login_worker().await;
-    Ok(HttpResponse::Ok().json(
-        tenant_summary_with_default_name(state.get_ref(), &tenant).await,
-    ))
+    Ok(HttpResponse::Ok().json(tenant_summary_with_default_name(state.get_ref(), &tenant).await))
 }
 
 async fn upsert_tenant(
@@ -211,7 +209,10 @@ async fn get_assistant_name(
     let configured = tenant.credential.read().await.assistant_name.clone();
     let (assistant_name, source) = match configured {
         Some(name) => (name, "tenant"),
-        None => (state.config.runtime.assistant_name.clone(), "runtime-default"),
+        None => (
+            state.config.runtime.assistant_name.clone(),
+            "runtime-default",
+        ),
     };
     Ok(HttpResponse::Ok().json(AssistantNameResponse {
         tenant_id,
@@ -229,7 +230,8 @@ async fn update_assistant_name(
     let tenant = state
         .get_tenant(&tenant_id)
         .ok_or_else(|| ServiceError::NotFound(format!("租户不存在: {tenant_id}")))?;
-    let assistant_name = normalize_required_text(payload.into_inner().assistant_name, "助手名称不能为空")?;
+    let assistant_name =
+        normalize_required_text(payload.into_inner().assistant_name, "助手名称不能为空")?;
     let mut credential = tenant.credential.read().await.clone();
     credential.assistant_name = Some(assistant_name.clone());
     state
@@ -536,7 +538,7 @@ async fn check_login_status(
                 body["tenant"] = serde_json::to_value(
                     tenant_summary_with_default_name(state.get_ref(), &tenant).await,
                 )
-                    .map_err(|err| ServiceError::Internal(format!("序列化租户状态失败: {err}")))?;
+                .map_err(|err| ServiceError::Internal(format!("序列化租户状态失败: {err}")))?;
             }
             return Ok(HttpResponse::Ok().json(body));
         }
@@ -565,7 +567,7 @@ async fn check_login_status(
             body["tenant"] = serde_json::to_value(
                 tenant_summary_with_default_name(state.get_ref(), &tenant).await,
             )
-                .map_err(|err| ServiceError::Internal(format!("序列化租户状态失败: {err}")))?;
+            .map_err(|err| ServiceError::Internal(format!("序列化租户状态失败: {err}")))?;
         }
         return Ok(HttpResponse::Ok().json(body));
     }
@@ -719,16 +721,30 @@ fn normalize_command_actions(
                 "命令 {text} 的 action 不能为空"
             )));
         }
-        if !matches!(action.as_str(), "new" | "abort" | "activate" | "call") {
+        if !matches!(
+            action.as_str(),
+            "new" | "abort" | "activate" | "call" | "list_sessions"
+        ) {
             return Err(ServiceError::BadRequest(format!(
-                "命令 {text} 的 action 不支持，当前只允许 new、abort、activate、call"
+                "命令 {text} 的 action 不支持，当前只允许 new、abort、activate、call、list_sessions"
             )));
         }
+        let agent_config_id = normalize_optional(item.agent_config_id);
         let session_id = normalize_optional(item.session_id);
         let service = normalize_optional(item.service);
         let method = normalize_optional(item.method);
         let params = item.params.filter(|value| !value.is_null());
 
+        if action == "new" && agent_config_id.is_some() && session_id.is_some() {
+            return Err(ServiceError::BadRequest(format!(
+                "命令 {text} 使用 new 并指定 agentConfigId 时不允许同时提供 sessionId"
+            )));
+        }
+        if action != "new" && agent_config_id.is_some() {
+            return Err(ServiceError::BadRequest(format!(
+                "命令 {text} 只有 action=new 时才允许提供 agentConfigId"
+            )));
+        }
         if action == "activate" && session_id.is_none() {
             return Err(ServiceError::BadRequest(format!(
                 "命令 {text} 使用 activate 时必须提供 sessionId"
@@ -774,9 +790,21 @@ fn normalize_command_actions(
                 "命令 {text} 只有 action=call 时才允许提供 params"
             )));
         }
+        if action == "list_sessions"
+            && (agent_config_id.is_some()
+                || session_id.is_some()
+                || service.is_some()
+                || method.is_some()
+                || params.is_some())
+        {
+            return Err(ServiceError::BadRequest(format!(
+                "命令 {text} 使用 list_sessions 时不允许提供额外参数"
+            )));
+        }
         out.push(CommandActionConfig {
             text,
             action,
+            agent_config_id,
             session_id,
             service,
             method,

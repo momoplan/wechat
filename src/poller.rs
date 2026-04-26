@@ -1,3 +1,4 @@
+use crate::channel_session_client::{self, ChannelSessionRecord};
 use crate::config::CommandActionConfig;
 use crate::models::ReceivedEvent;
 use crate::state::{AppState, TenantContext};
@@ -6,7 +7,7 @@ use aes::Aes128;
 use aes::cipher::{BlockDecryptMut, KeyInit, block_padding::Pkcs7};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-use chrono::Utc;
+use chrono::{Local, TimeZone, Utc};
 use ecb::Decryptor;
 use hex::decode as hex_decode;
 use serde_json::{Value, json};
@@ -17,6 +18,7 @@ use tracing::{error, info, warn};
 
 const LOWCODE_FORWARD_FALLBACK_MESSAGE: &str = "消息暂时处理失败，请稍后重试或联系管理员。";
 const WECHAT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
+const SESSION_LIST_COMMAND_LIMIT: usize = 10;
 
 type Aes128EcbDec = Decryptor<Aes128>;
 
@@ -24,6 +26,7 @@ type Aes128EcbDec = Decryptor<Aes128>;
 struct InboundCommand {
     text: String,
     action: String,
+    agent_config_id: Option<String>,
     session_id: Option<String>,
     service: Option<String>,
     method: Option<String>,
@@ -327,6 +330,7 @@ fn detect_inbound_command(
             Some(InboundCommand {
                 text: text.clone(),
                 action: item.action.clone(),
+                agent_config_id: item.agent_config_id.clone(),
                 session_id: item.session_id.clone(),
                 service: item.service.clone(),
                 method: item.method.clone(),
@@ -429,11 +433,7 @@ fn build_lowcode_inbound_content(msg: &Value) -> Option<Value> {
     }
 }
 
-fn build_media_content_part(
-    item: &Value,
-    part_type: &str,
-    media_kind: &str,
-) -> Value {
+fn build_media_content_part(item: &Value, part_type: &str, media_kind: &str) -> Value {
     let detail_key = match media_kind {
         "image" => "image_item",
         "audio" => "voice_item",
@@ -739,6 +739,14 @@ async fn maybe_forward_to_lowcode_agent(
     inbound_command: Option<InboundCommand>,
     context_token: Option<&str>,
 ) {
+    if let Some(command) = inbound_command.as_ref() {
+        if command.action.eq_ignore_ascii_case("list_sessions") {
+            handle_local_list_sessions_command(state, tenant, user_id, context_token, command)
+                .await;
+            return;
+        }
+    }
+
     let credential = tenant.credential.read().await.clone();
     let forward_enabled = credential.lowcode_forward_enabled.unwrap_or(false);
     if !forward_enabled {
@@ -787,6 +795,7 @@ async fn maybe_forward_to_lowcode_agent(
                 "messageType": raw_message.get("message_type"),
                 "fromUserId": user_id,
                 "command": command.text,
+                "agentConfigId": command.agent_config_id,
                 "sessionId": command.session_id,
                 "content": content
             });
@@ -892,6 +901,48 @@ async fn maybe_forward_to_lowcode_agent(
     }
 }
 
+async fn handle_local_list_sessions_command(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    user_id: &str,
+    context_token: Option<&str>,
+    command: &InboundCommand,
+) {
+    let session_key = format!("wechat:dm:{user_id}");
+    let reply_text = match channel_session_client::list_session_records(
+        state,
+        tenant,
+        &session_key,
+        SESSION_LIST_COMMAND_LIMIT,
+    )
+    .await
+    {
+        Ok(records) => build_session_list_text(&records),
+        Err(err) => {
+            warn!(
+                tenant_id = %tenant.tenant_id,
+                user_id,
+                action = %command.action,
+                error = %err,
+                "查询微信渠道会话列表失败"
+            );
+            build_local_command_error_message(&err)
+        }
+    };
+
+    if let Err(err) =
+        wechat_api::send_text_to_user(state, tenant, user_id, &reply_text, context_token).await
+    {
+        warn!(
+            tenant_id = %tenant.tenant_id,
+            user_id,
+            action = %command.action,
+            error = %err,
+            "微信本地命令回复发送失败"
+        );
+    }
+}
+
 async fn maybe_reply_session_control_success(
     state: &Arc<AppState>,
     tenant: &Arc<TenantContext>,
@@ -979,6 +1030,73 @@ fn build_lowcode_inbound_endpoint(base_url: &str) -> String {
     }
 }
 
+fn build_session_list_text(records: &[ChannelSessionRecord]) -> String {
+    if records.is_empty() {
+        return "当前还没有历史会话。".to_string();
+    }
+
+    let mut lines = vec!["最近会话（新到旧）：".to_string()];
+    for (index, record) in records.iter().enumerate() {
+        let current = if record.is_current { " [当前]" } else { "" };
+        lines.push(format!("{}. {}{}", index + 1, record.session_id, current));
+        lines.push(format!(
+            "最近活跃：{} | 消息数：{}",
+            format_unix_timestamp(record.last_active_at_unix),
+            record.message_count
+        ));
+        if let Some(preview) = record
+            .latest_message_preview
+            .as_deref()
+            .and_then(normalize_preview_text)
+        {
+            lines.push(format!("预览：{}", truncate_preview(&preview, 60)));
+        }
+    }
+    lines.push("可用已配置的切换命令切到指定会话。".to_string());
+    lines.join("\n")
+}
+
+fn build_local_command_error_message(err: &crate::error::ServiceError) -> String {
+    match err {
+        crate::error::ServiceError::BadRequest(message)
+        | crate::error::ServiceError::NotFound(message)
+        | crate::error::ServiceError::Unauthorized(message) => message.clone(),
+        crate::error::ServiceError::Upstream(_) | crate::error::ServiceError::Internal(_) => {
+            "暂时无法查询会话，请稍后重试。".to_string()
+        }
+    }
+}
+
+fn format_unix_timestamp(timestamp: i64) -> String {
+    if timestamp <= 0 {
+        return "-".to_string();
+    }
+    Local
+        .timestamp_opt(timestamp, 0)
+        .single()
+        .map(|datetime| datetime.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn truncate_preview(text: &str, limit: usize) -> String {
+    let compact = text.replace('\n', " ");
+    let compact = compact.trim();
+    if compact.chars().count() <= limit {
+        return compact.to_string();
+    }
+    compact.chars().take(limit).collect::<String>() + "..."
+}
+
+fn normalize_preview_text(text: &str) -> Option<String> {
+    let normalized = text.replace('\r', "\n");
+    let trimmed = normalized.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn extract_session_control_success(payload: &Value) -> Option<SessionControlSuccess> {
     [
         Some(payload),
@@ -1036,14 +1154,16 @@ fn session_control_success_reply_text(action: &str) -> Option<&'static str> {
 mod tests {
     use super::{
         InboundCommand, SessionControlSuccess, build_lowcode_inbound_content,
-        build_wechat_cdn_download_url, decode_wechat_aes_key_hex, decrypt_aes_ecb,
-        detect_inbound_command, extract_session_control_success, extract_wechat_media_aes_key,
-        guess_image_mime_type, has_media_items, mark_image_part_transfer, normalize_assistant_name,
-        normalize_command_text, normalize_image_content_type, session_control_success_reply_text,
+        build_session_list_text, build_wechat_cdn_download_url, decode_wechat_aes_key_hex,
+        decrypt_aes_ecb, detect_inbound_command, extract_session_control_success,
+        extract_wechat_media_aes_key, guess_image_mime_type, has_media_items,
+        mark_image_part_transfer, normalize_assistant_name, normalize_command_text,
+        normalize_image_content_type, normalize_preview_text, session_control_success_reply_text,
     };
+    use crate::channel_session_client::ChannelSessionRecord;
+    use crate::config::CommandActionConfig;
     use aes::Aes128;
     use aes::cipher::{BlockEncryptMut, KeyInit, block_padding::Pkcs7};
-    use crate::config::CommandActionConfig;
     use ecb::Encryptor;
     use serde_json::Value;
     use serde_json::json;
@@ -1260,6 +1380,7 @@ mod tests {
             CommandActionConfig {
                 text: "新话题".to_string(),
                 action: "new".to_string(),
+                agent_config_id: None,
                 session_id: None,
                 service: None,
                 method: None,
@@ -1268,6 +1389,7 @@ mod tests {
             CommandActionConfig {
                 text: "开始新话题".to_string(),
                 action: "new".to_string(),
+                agent_config_id: None,
                 session_id: None,
                 service: None,
                 method: None,
@@ -1279,6 +1401,7 @@ mod tests {
             Some(InboundCommand {
                 text: "新话题".to_string(),
                 action: "new".to_string(),
+                agent_config_id: None,
                 session_id: None,
                 service: None,
                 method: None,
@@ -1290,6 +1413,7 @@ mod tests {
             Some(InboundCommand {
                 text: "新话题".to_string(),
                 action: "new".to_string(),
+                agent_config_id: None,
                 session_id: None,
                 service: None,
                 method: None,
@@ -1304,6 +1428,7 @@ mod tests {
             CommandActionConfig {
                 text: "新话题".to_string(),
                 action: "new".to_string(),
+                agent_config_id: None,
                 session_id: None,
                 service: None,
                 method: None,
@@ -1312,6 +1437,7 @@ mod tests {
             CommandActionConfig {
                 text: "结束当前会话".to_string(),
                 action: "abort".to_string(),
+                agent_config_id: None,
                 session_id: None,
                 service: None,
                 method: None,
@@ -1319,7 +1445,13 @@ mod tests {
             },
         ];
         assert_eq!(
-            detect_inbound_command(Some(1), "小百 新话题 帮我总结一下", false, "小百", &commands),
+            detect_inbound_command(
+                Some(1),
+                "小百 新话题 帮我总结一下",
+                false,
+                "小百",
+                &commands
+            ),
             None
         );
         assert_eq!(
@@ -1331,18 +1463,20 @@ mod tests {
     #[test]
     fn detects_custom_configured_new_session_command() {
         let commands = vec![CommandActionConfig {
-                text: "重置话题".to_string(),
-                action: "new".to_string(),
-                session_id: None,
-                service: None,
-                method: None,
-                params: None,
-            }];
+            text: "重置话题".to_string(),
+            action: "new".to_string(),
+            agent_config_id: None,
+            session_id: None,
+            service: None,
+            method: None,
+            params: None,
+        }];
         assert_eq!(
             detect_inbound_command(Some(1), " 小百 重置话题 ", false, "小百", &commands),
             Some(InboundCommand {
                 text: "重置话题".to_string(),
                 action: "new".to_string(),
+                agent_config_id: None,
                 session_id: None,
                 service: None,
                 method: None,
@@ -1360,6 +1494,7 @@ mod tests {
         let commands = vec![CommandActionConfig {
             text: "结束当前会话".to_string(),
             action: "abort".to_string(),
+            agent_config_id: None,
             session_id: None,
             service: None,
             method: None,
@@ -1370,6 +1505,7 @@ mod tests {
             Some(InboundCommand {
                 text: "结束当前会话".to_string(),
                 action: "abort".to_string(),
+                agent_config_id: None,
                 session_id: None,
                 service: None,
                 method: None,
@@ -1383,6 +1519,7 @@ mod tests {
         let commands = vec![CommandActionConfig {
             text: "切回订单会话".to_string(),
             action: "activate".to_string(),
+            agent_config_id: None,
             session_id: Some("sess_order_123".to_string()),
             service: None,
             method: None,
@@ -1393,6 +1530,7 @@ mod tests {
             Some(InboundCommand {
                 text: "切回订单会话".to_string(),
                 action: "activate".to_string(),
+                agent_config_id: None,
                 session_id: Some("sess_order_123".to_string()),
                 service: None,
                 method: None,
@@ -1406,6 +1544,7 @@ mod tests {
         let commands = vec![CommandActionConfig {
             text: "查询积分".to_string(),
             action: "call".to_string(),
+            agent_config_id: None,
             session_id: None,
             service: Some("crm-service".to_string()),
             method: Some("getPoints".to_string()),
@@ -1418,12 +1557,63 @@ mod tests {
             Some(InboundCommand {
                 text: "查询积分".to_string(),
                 action: "call".to_string(),
+                agent_config_id: None,
                 session_id: None,
                 service: Some("crm-service".to_string()),
                 method: Some("getPoints".to_string()),
                 params: Some(json!({
                     "scene": "wechat"
                 })),
+            })
+        );
+    }
+
+    #[test]
+    fn detects_new_session_command_with_agent_config_id() {
+        let commands = vec![CommandActionConfig {
+            text: "切到客服助手".to_string(),
+            action: "new".to_string(),
+            agent_config_id: Some("agent_20001".to_string()),
+            session_id: None,
+            service: None,
+            method: None,
+            params: None,
+        }];
+        assert_eq!(
+            detect_inbound_command(Some(1), "小百 切到客服助手", false, "小百", &commands),
+            Some(InboundCommand {
+                text: "切到客服助手".to_string(),
+                action: "new".to_string(),
+                agent_config_id: Some("agent_20001".to_string()),
+                session_id: None,
+                service: None,
+                method: None,
+                params: None,
+            })
+        );
+    }
+
+    #[test]
+    fn detects_list_sessions_command() {
+        let commands = vec![CommandActionConfig {
+            text: "列会话".to_string(),
+            action: "list_sessions".to_string(),
+            agent_config_id: None,
+            session_id: None,
+            service: None,
+            method: None,
+            params: None,
+        }];
+        assert_eq!(
+            detect_inbound_command(Some(1), "小百 列会话", false, "小百", &commands),
+            Some(InboundCommand {
+                text: "列会话".to_string(),
+                action: "list_sessions".to_string(),
+                agent_config_id: None,
+                session_id: None,
+                service: None,
+                method: None,
+                params: None,
             })
         );
     }
@@ -1497,5 +1687,40 @@ mod tests {
             Some("已切换到指定会话，可以继续发送消息了。")
         );
         assert_eq!(session_control_success_reply_text("abort"), None);
+    }
+
+    #[test]
+    fn builds_session_list_text_with_current_marker() {
+        let text = build_session_list_text(&[
+            ChannelSessionRecord {
+                session_id: "sess_current".to_string(),
+                created_at_unix: 1_700_000_000,
+                last_active_at_unix: 1_700_000_100,
+                is_current: true,
+                message_count: 12,
+                latest_message_preview: Some("你好\n继续".to_string()),
+            },
+            ChannelSessionRecord {
+                session_id: "sess_old".to_string(),
+                created_at_unix: 1_699_999_000,
+                last_active_at_unix: 1_699_999_100,
+                is_current: false,
+                message_count: 3,
+                latest_message_preview: None,
+            },
+        ]);
+
+        assert!(text.contains("1. sess_current [当前]"));
+        assert!(text.contains("2. sess_old"));
+        assert!(text.contains("预览：你好 继续"));
+    }
+
+    #[test]
+    fn normalizes_preview_text() {
+        assert_eq!(
+            normalize_preview_text(" \nhello\r\n "),
+            Some("hello".to_string())
+        );
+        assert_eq!(normalize_preview_text("   "), None);
     }
 }

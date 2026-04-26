@@ -19,7 +19,7 @@
 - 当前实现基于 `https://ilinkai.weixin.qq.com/ilink/bot/*` 这条能力链路。
 - 这不是仓库内能对应到的微信公开标准开放平台 Bot API，建议先按内测/PoC 使用。
 - 当前会话模型只支持私聊：`sessionKey = wechat:dm:<user_id>`。
-- 微信用户发送命中“助手名称 + 命令文本”的精确文本命令时，服务会转成 `session-control`，并把映射到的 `action` 原样发给 channel-gateway。
+- 微信用户发送命中“助手名称 + 命令文本”的精确文本命令时，服务会优先按命令动作处理；其中 `new/abort/activate/call` 会转成 `session-control` 发给 channel-gateway，`list_sessions` 由 wechat 本地直接查会话并回复。
 - 命令配置优先读取租户级动态配置；未配置时回退到 `runtime.command_actions` 默认值。
 - 助手名称优先读取租户级 `assistantName`；未配置时回退到 `runtime.assistant_name` 默认值。
 
@@ -74,7 +74,7 @@ curl -X PUT http://127.0.0.1:3211/tenants/demo \
   -H 'Content-Type: application/json' \
   -d '{
     "assistantName":"小百",
-    "gateway_url":"http://127.0.0.1:4020/channels/wechat",
+    "gateway_url":"http://127.0.0.1:4020/workspaces/acme/channels/wechat",
     "lowcode_forward_enabled":true,
     "enabled": true
   }'
@@ -89,7 +89,7 @@ curl -X PUT http://127.0.0.1:3211/tenants/demo \
     "botToken":"replace-with-bot-token",
     "baseUrl":"https://ilinkai.weixin.qq.com",
     "assistantName":"小百",
-    "gateway_url":"http://127.0.0.1:4020/channels/wechat",
+    "gateway_url":"http://127.0.0.1:4020/workspaces/acme/channels/wechat",
     "lowcode_forward_enabled":true,
     "enabled": true
   }'
@@ -188,7 +188,9 @@ curl -X PUT http://127.0.0.1:3211/tenants/demo/command-actions \
   -d '{
     "commandActions": [
       { "text": "新话题", "action": "new" },
+      { "text": "切到客服助手", "action": "new", "agentConfigId": "agent_20001" },
       { "text": "结束当前会话", "action": "abort" },
+      { "text": "列会话", "action": "list_sessions" },
       { "text": "切回订单会话", "action": "activate", "sessionId": "sess_xxx" },
       {
         "text": "查询积分",
@@ -204,17 +206,22 @@ curl -X PUT http://127.0.0.1:3211/tenants/demo/command-actions \
 当前支持的 action：
 - `new`：基于当前 `sessionKey` 新建并激活会话
 - `abort`：终止当前激活会话
+- `list_sessions`：直接列出当前微信私聊最近会话
 - `activate`：切换到指定历史 `sessionId`
 - `call`：直接调用后端 runtime action
 
 说明：
 - 用户实际发送格式为：`助手名称 + 命令文本`，例如 `小百 新话题`
+- `new` 可选带 `agentConfigId`，用于用指定 agent 新建会话
+- `list_sessions` 不允许带其他扩展参数
 - `activate` 必须带 `sessionId`
 - `new` / `abort` 不允许带 `sessionId`
+- `agentConfigId` 只有 `action=new` 时允许提供
 - `call` 必须带 `service`、`method`、`params`
 - `call` 的 `params` 必须是 JSON 对象
 - `service` / `method` / `params` 只有 `action=call` 时允许提供
 - 命令仍然按整条文本精确匹配
+- 会话类本地命令当前依赖标准 channel 路由形式的 `gateway_url`，例如 `/workspaces/{workspace}/channels/wechat`
 
 删除租户自定义命令并恢复默认：
 

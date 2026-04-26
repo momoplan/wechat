@@ -54,6 +54,8 @@ pub struct CommandActionConfig {
     pub text: String,
     #[serde(default)]
     pub action: String,
+    #[serde(default, alias = "agentConfigId", alias = "agentId")]
+    pub agent_config_id: Option<String>,
     #[serde(default, alias = "sessionId", alias = "targetSessionId")]
     pub session_id: Option<String>,
     #[serde(default)]
@@ -159,6 +161,7 @@ fn default_command_actions() -> Vec<CommandActionConfig> {
         CommandActionConfig {
             text: "新话题".to_string(),
             action: "new".to_string(),
+            agent_config_id: None,
             session_id: None,
             service: None,
             method: None,
@@ -167,6 +170,16 @@ fn default_command_actions() -> Vec<CommandActionConfig> {
         CommandActionConfig {
             text: "结束当前会话".to_string(),
             action: "abort".to_string(),
+            agent_config_id: None,
+            session_id: None,
+            service: None,
+            method: None,
+            params: None,
+        },
+        CommandActionConfig {
+            text: "列会话".to_string(),
+            action: "list_sessions".to_string(),
+            agent_config_id: None,
             session_id: None,
             service: None,
             method: None,
@@ -241,7 +254,9 @@ impl Default for AppConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommandActionConfig, RuntimeConfig, default_assistant_name, default_command_actions};
+    use super::{
+        CommandActionConfig, RuntimeConfig, default_assistant_name, default_command_actions,
+    };
 
     #[test]
     fn runtime_defaults_include_default_command_actions() {
@@ -261,6 +276,7 @@ mod tests {
                 CommandActionConfig {
                     text: "新话题".to_string(),
                     action: "new".to_string(),
+                    agent_config_id: None,
                     session_id: None,
                     service: None,
                     method: None,
@@ -269,6 +285,16 @@ mod tests {
                 CommandActionConfig {
                     text: "结束当前会话".to_string(),
                     action: "abort".to_string(),
+                    agent_config_id: None,
+                    session_id: None,
+                    service: None,
+                    method: None,
+                    params: None,
+                },
+                CommandActionConfig {
+                    text: "列会话".to_string(),
+                    action: "list_sessions".to_string(),
+                    agent_config_id: None,
                     session_id: None,
                     service: None,
                     method: None,

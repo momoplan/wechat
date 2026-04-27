@@ -17,7 +17,12 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 const LOWCODE_FORWARD_FALLBACK_MESSAGE: &str = "消息暂时处理失败，请稍后重试或联系管理员。";
+const LOWCODE_FORWARD_PAYLOAD_TOO_LARGE_MESSAGE: &str =
+    "这张图片太大，当前无法直接处理。请先压缩图片后重试，或改为发送图片链接。";
 const WECHAT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
+// Base64 内联会把图片体积放大约 33%，这里额外留一部分 JSON 包体余量，
+// 避免在上游链路较紧的 body limit 下把 /inbound 请求直接撑爆。
+const MAX_TRANSPORT_INLINE_IMAGE_BYTES: usize = 80 * 1024;
 const SESSION_LIST_COMMAND_LIMIT: usize = 10;
 
 type Aes128EcbDec = Decryptor<Aes128>;
@@ -498,13 +503,18 @@ async fn inline_inbound_images(
         return content;
     };
 
-    let max_inline_bytes = state.config.runtime.max_inline_image_bytes.max(1);
+    let max_inline_bytes =
+        effective_inline_image_max_bytes(state.config.runtime.max_inline_image_bytes);
     let mut updated = Vec::with_capacity(parts.len());
     for part in parts {
         updated.push(inline_image_part(state, tenant, part.clone(), max_inline_bytes).await);
     }
 
     Value::Array(updated)
+}
+
+fn effective_inline_image_max_bytes(configured_max: usize) -> usize {
+    configured_max.max(1).min(MAX_TRANSPORT_INLINE_IMAGE_BYTES)
 }
 
 async fn inline_image_part(
@@ -546,21 +556,25 @@ async fn inline_image_part(
             warn!(
                 tenant_id = %tenant.tenant_id,
                 max_inline_bytes,
-                "微信图片超过内联大小上限，继续透传原始链接"
+                "微信图片超过内联大小上限，改走文件透传"
             );
-            mark_image_part_transfer(
+            convert_image_part_to_file_fallback(
                 part,
                 Value::String(original_url.clone()),
-                "external_url_fallback",
+                "file_url_fallback",
             )
         }
         Err(err) => {
             warn!(
                 tenant_id = %tenant.tenant_id,
                 error = %err,
-                "微信图片内联失败，继续透传原始链接"
+                "微信图片内联失败，改走文件透传"
             );
-            mark_image_part_transfer(part, Value::String(original_url), "external_url_fallback")
+            convert_image_part_to_file_fallback(
+                part,
+                Value::String(original_url),
+                "file_url_fallback",
+            )
         }
     }
 }
@@ -574,6 +588,24 @@ fn mark_image_part_transfer(mut part: Value, image_url: Value, transfer: &str) -
         other => other,
     };
     object.insert("image_url".to_string(), normalized_image_url);
+    object.insert(
+        "imageTransfer".to_string(),
+        Value::String(transfer.to_string()),
+    );
+    part
+}
+
+fn convert_image_part_to_file_fallback(mut part: Value, file_url: Value, transfer: &str) -> Value {
+    let Some(object) = part.as_object_mut() else {
+        return part;
+    };
+    let normalized_file_url = match file_url {
+        Value::String(url) => json!({ "url": url }),
+        other => other,
+    };
+    object.insert("type".to_string(), Value::String("file".to_string()));
+    object.remove("image_url");
+    object.insert("file".to_string(), normalized_file_url);
     object.insert(
         "imageTransfer".to_string(),
         Value::String(transfer.to_string()),
@@ -991,11 +1023,16 @@ async fn reply_lowcode_forward_failure(
     context_token: Option<&str>,
     status_code: Option<u16>,
 ) {
+    let reply_text = match status_code {
+        Some(413) => LOWCODE_FORWARD_PAYLOAD_TOO_LARGE_MESSAGE,
+        _ => LOWCODE_FORWARD_FALLBACK_MESSAGE,
+    };
+
     if let Err(err) = wechat_api::send_text_to_user(
         state,
         tenant,
         user_id,
-        LOWCODE_FORWARD_FALLBACK_MESSAGE,
+        reply_text,
         context_token,
     )
     .await
@@ -1155,10 +1192,11 @@ mod tests {
     use super::{
         InboundCommand, SessionControlSuccess, build_lowcode_inbound_content,
         build_session_list_text, build_wechat_cdn_download_url, decode_wechat_aes_key_hex,
-        decrypt_aes_ecb, detect_inbound_command, extract_session_control_success,
-        extract_wechat_media_aes_key, guess_image_mime_type, has_media_items,
-        mark_image_part_transfer, normalize_assistant_name, normalize_command_text,
-        normalize_image_content_type, normalize_preview_text, session_control_success_reply_text,
+        decrypt_aes_ecb, detect_inbound_command, effective_inline_image_max_bytes,
+        extract_session_control_success, extract_wechat_media_aes_key, guess_image_mime_type,
+        has_media_items, mark_image_part_transfer, normalize_assistant_name,
+        normalize_command_text, normalize_image_content_type, normalize_preview_text,
+        session_control_success_reply_text, convert_image_part_to_file_fallback,
     };
     use crate::channel_session_client::ChannelSessionRecord;
     use crate::config::CommandActionConfig;
@@ -1308,6 +1346,16 @@ mod tests {
     }
 
     #[test]
+    fn caps_inline_image_bytes_for_transport_safety() {
+        assert_eq!(effective_inline_image_max_bytes(0), 1);
+        assert_eq!(effective_inline_image_max_bytes(32 * 1024), 32 * 1024);
+        assert_eq!(
+            effective_inline_image_max_bytes(5 * 1024 * 1024),
+            80 * 1024
+        );
+    }
+
+    #[test]
     fn marks_image_part_with_inline_transfer_metadata() {
         let part = json!({
             "type": "image_url",
@@ -1329,6 +1377,37 @@ mod tests {
         );
         assert_eq!(updated["imageTransfer"], "inline_data_url");
         assert_eq!(updated["source"], "wechat");
+    }
+
+    #[test]
+    fn converts_oversized_image_part_to_file_fallback() {
+        let part = json!({
+            "type": "image_url",
+            "image_url": {
+                "url": "https://example.com/original.png"
+            },
+            "mediaType": "image",
+            "source": "wechat",
+            "wechatMedia": {
+                "mid_size": 123
+            }
+        });
+
+        let updated = convert_image_part_to_file_fallback(
+            part,
+            Value::String("https://example.com/original.png".to_string()),
+            "file_url_fallback",
+        );
+
+        assert_eq!(updated["type"], "file");
+        assert_eq!(
+            updated["file"],
+            json!({"url": "https://example.com/original.png"})
+        );
+        assert_eq!(updated["mediaType"], "image");
+        assert_eq!(updated["imageTransfer"], "file_url_fallback");
+        assert_eq!(updated["source"], "wechat");
+        assert!(updated.get("image_url").is_none());
     }
 
     #[test]

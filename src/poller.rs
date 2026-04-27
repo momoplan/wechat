@@ -16,6 +16,8 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 
 const LOWCODE_FORWARD_FALLBACK_MESSAGE: &str = "消息暂时处理失败，请稍后重试或联系管理员。";
+const LOWCODE_FORWARD_PAYLOAD_TOO_LARGE_MESSAGE: &str =
+    "这张图片太大，当前无法直接处理。请先压缩图片后重试，或改为发送图片链接。";
 const WECHAT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
 
 type Aes128EcbDec = Decryptor<Aes128>;
@@ -940,11 +942,16 @@ async fn reply_lowcode_forward_failure(
     context_token: Option<&str>,
     status_code: Option<u16>,
 ) {
+    let reply_text = match status_code {
+        Some(413) => LOWCODE_FORWARD_PAYLOAD_TOO_LARGE_MESSAGE,
+        _ => LOWCODE_FORWARD_FALLBACK_MESSAGE,
+    };
+
     if let Err(err) = wechat_api::send_text_to_user(
         state,
         tenant,
         user_id,
-        LOWCODE_FORWARD_FALLBACK_MESSAGE,
+        reply_text,
         context_token,
     )
     .await

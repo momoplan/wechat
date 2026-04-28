@@ -723,10 +723,10 @@ fn normalize_command_actions(
         }
         if !matches!(
             action.as_str(),
-            "new" | "abort" | "activate" | "call" | "list_sessions"
+            "new" | "abort" | "activate" | "call" | "list_sessions" | "list_commands"
         ) {
             return Err(ServiceError::BadRequest(format!(
-                "命令 {text} 的 action 不支持，当前只允许 new、abort、activate、call、list_sessions"
+                "命令 {text} 的 action 不支持，当前只允许 new、abort、activate、call、list_sessions、list_commands"
             )));
         }
         let agent_config_id = normalize_optional(item.agent_config_id);
@@ -790,7 +790,7 @@ fn normalize_command_actions(
                 "命令 {text} 只有 action=call 时才允许提供 params"
             )));
         }
-        if action == "list_sessions"
+        if matches!(action.as_str(), "list_sessions" | "list_commands")
             && (agent_config_id.is_some()
                 || session_id.is_some()
                 || service.is_some()
@@ -798,7 +798,7 @@ fn normalize_command_actions(
                 || params.is_some())
         {
             return Err(ServiceError::BadRequest(format!(
-                "命令 {text} 使用 list_sessions 时不允许提供额外参数"
+                "命令 {text} 使用 {action} 时不允许提供额外参数"
             )));
         }
         out.push(CommandActionConfig {

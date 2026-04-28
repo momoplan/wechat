@@ -17,6 +17,8 @@ runtime:
       action: "new"
     - text: "结束当前会话"
       action: "abort"
+    - text: "命令列表"
+      action: "list_commands"
     - text: "查询积分"
       action: "call"
       service: "crm-service"

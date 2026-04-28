@@ -177,6 +177,15 @@ fn default_command_actions() -> Vec<CommandActionConfig> {
             params: None,
         },
         CommandActionConfig {
+            text: "命令列表".to_string(),
+            action: "list_commands".to_string(),
+            agent_config_id: None,
+            session_id: None,
+            service: None,
+            method: None,
+            params: None,
+        },
+        CommandActionConfig {
             text: "列会话".to_string(),
             action: "list_sessions".to_string(),
             agent_config_id: None,
@@ -285,6 +294,15 @@ mod tests {
                 CommandActionConfig {
                     text: "结束当前会话".to_string(),
                     action: "abort".to_string(),
+                    agent_config_id: None,
+                    session_id: None,
+                    service: None,
+                    method: None,
+                    params: None,
+                },
+                CommandActionConfig {
+                    text: "命令列表".to_string(),
+                    action: "list_commands".to_string(),
                     agent_config_id: None,
                     session_id: None,
                     service: None,

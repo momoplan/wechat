@@ -797,6 +797,11 @@ async fn maybe_forward_to_lowcode_agent(
     context_token: Option<&str>,
 ) {
     let inbound_command = if let Some(command) = inbound_command {
+        if command.action.eq_ignore_ascii_case("list_commands") {
+            handle_local_list_commands_command(state, tenant, user_id, context_token, &command)
+                .await;
+            return;
+        }
         if command.action.eq_ignore_ascii_case("list_sessions") {
             handle_local_list_sessions_command(state, tenant, user_id, context_token, &command)
                 .await;
@@ -842,8 +847,8 @@ async fn maybe_forward_to_lowcode_agent(
     };
 
     if let Some(command) = inbound_command.as_ref() {
-        if command.action.eq_ignore_ascii_case("list_sessions") {
-            unreachable!("list_sessions should have been handled locally before forwarding");
+        if matches!(command.action.as_str(), "list_sessions" | "list_commands") {
+            unreachable!("local command should have been handled before forwarding");
         }
     }
 
@@ -1043,6 +1048,38 @@ async fn handle_local_list_sessions_command(
     }
 }
 
+async fn handle_local_list_commands_command(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    user_id: &str,
+    context_token: Option<&str>,
+    command: &InboundCommand,
+) {
+    let credential = tenant.credential.read().await;
+    let assistant_name = credential
+        .assistant_name
+        .clone()
+        .unwrap_or_else(|| state.config.runtime.assistant_name.clone());
+    let command_actions = credential
+        .command_actions
+        .clone()
+        .unwrap_or_else(|| state.config.runtime.command_actions.clone());
+    drop(credential);
+
+    let reply_text = build_command_list_text(&assistant_name, &command_actions);
+    if let Err(err) =
+        wechat_api::send_text_to_user(state, tenant, user_id, &reply_text, context_token).await
+    {
+        warn!(
+            tenant_id = %tenant.tenant_id,
+            user_id,
+            action = %command.action,
+            error = %err,
+            "微信本地命令回复发送失败"
+        );
+    }
+}
+
 async fn resolve_recent_session_activate_command(
     state: &Arc<AppState>,
     tenant: &Arc<TenantContext>,
@@ -1147,14 +1184,8 @@ async fn reply_lowcode_forward_failure(
         _ => LOWCODE_FORWARD_FALLBACK_MESSAGE,
     };
 
-    if let Err(err) = wechat_api::send_text_to_user(
-        state,
-        tenant,
-        user_id,
-        reply_text,
-        context_token,
-    )
-    .await
+    if let Err(err) =
+        wechat_api::send_text_to_user(state, tenant, user_id, reply_text, context_token).await
     {
         warn!(
             tenant_id = %tenant.tenant_id,
@@ -1209,6 +1240,32 @@ fn build_session_list_text(records: &[ChannelSessionRecord]) -> String {
         }
     }
     lines.push("发送“助手名 + 序号”可直接切换，例如：小百 2".to_string());
+    lines.join("\n")
+}
+
+fn build_command_list_text(
+    assistant_name: &str,
+    command_actions: &[CommandActionConfig],
+) -> String {
+    let normalized_assistant_name =
+        normalize_assistant_name(assistant_name).unwrap_or_else(|| "小百".to_string());
+    let mut lines = vec!["当前可用命令：".to_string()];
+    for item in command_actions {
+        lines.push(format!(
+            "- {} {}",
+            normalized_assistant_name,
+            item.text.trim()
+        ));
+    }
+    if command_actions
+        .iter()
+        .any(|item| item.action.eq_ignore_ascii_case("list_sessions"))
+    {
+        lines.push(format!(
+            "- {} <序号>：切换到最近会话列表里的对应会话",
+            normalized_assistant_name
+        ));
+    }
     lines.join("\n")
 }
 
@@ -1309,14 +1366,14 @@ fn session_control_success_reply_text(action: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVATE_RECENT_ACTION, InboundCommand, SessionControlSuccess, build_lowcode_inbound_content,
-        build_session_list_text, build_wechat_cdn_download_url, decode_wechat_aes_key_hex,
-        decrypt_aes_ecb, detect_inbound_command, effective_inline_image_max_bytes,
-        extract_session_control_success, extract_wechat_media_aes_key, guess_image_mime_type,
-        has_media_items, mark_image_part_transfer, normalize_assistant_name,
-        normalize_command_text, normalize_image_content_type, normalize_preview_text,
-        parse_recent_session_index, resolve_recent_session_record,
-        session_control_success_reply_text, convert_image_part_to_file_fallback,
+        ACTIVATE_RECENT_ACTION, InboundCommand, SessionControlSuccess, build_command_list_text,
+        build_lowcode_inbound_content, build_session_list_text, build_wechat_cdn_download_url,
+        convert_image_part_to_file_fallback, decode_wechat_aes_key_hex, decrypt_aes_ecb,
+        detect_inbound_command, effective_inline_image_max_bytes, extract_session_control_success,
+        extract_wechat_media_aes_key, guess_image_mime_type, has_media_items,
+        mark_image_part_transfer, normalize_assistant_name, normalize_command_text,
+        normalize_image_content_type, normalize_preview_text, parse_recent_session_index,
+        resolve_recent_session_record, session_control_success_reply_text,
     };
     use crate::channel_session_client::ChannelSessionRecord;
     use crate::config::CommandActionConfig;
@@ -1469,10 +1526,7 @@ mod tests {
     fn caps_inline_image_bytes_for_transport_safety() {
         assert_eq!(effective_inline_image_max_bytes(0), 1);
         assert_eq!(effective_inline_image_max_bytes(32 * 1024), 32 * 1024);
-        assert_eq!(
-            effective_inline_image_max_bytes(5 * 1024 * 1024),
-            80 * 1024
-        );
+        assert_eq!(effective_inline_image_max_bytes(5 * 1024 * 1024), 80 * 1024);
     }
 
     #[test]
@@ -1946,6 +2000,48 @@ mod tests {
         assert!(text.contains("2. sess_old"));
         assert!(text.contains("预览：你好 继续"));
         assert!(text.contains("小百 2"));
+    }
+
+    #[test]
+    fn builds_command_list_text_with_recent_session_hint() {
+        let text = build_command_list_text(
+            " 小百 ",
+            &[
+                CommandActionConfig {
+                    text: "新话题".to_string(),
+                    action: "new".to_string(),
+                    agent_config_id: None,
+                    session_id: None,
+                    service: None,
+                    method: None,
+                    params: None,
+                },
+                CommandActionConfig {
+                    text: "命令列表".to_string(),
+                    action: "list_commands".to_string(),
+                    agent_config_id: None,
+                    session_id: None,
+                    service: None,
+                    method: None,
+                    params: None,
+                },
+                CommandActionConfig {
+                    text: "列会话".to_string(),
+                    action: "list_sessions".to_string(),
+                    agent_config_id: None,
+                    session_id: None,
+                    service: None,
+                    method: None,
+                    params: None,
+                },
+            ],
+        );
+
+        assert!(text.contains("当前可用命令："));
+        assert!(text.contains("- 小百 新话题"));
+        assert!(text.contains("- 小百 命令列表"));
+        assert!(text.contains("- 小百 列会话"));
+        assert!(text.contains("- 小百 <序号>：切换到最近会话列表里的对应会话"));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 const LIST_SESSION_RECORDS_PATH: &str = "sessions/list";
+const LIST_SESSION_RECORDS_METHOD: &str = "listSessions";
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -23,11 +24,89 @@ pub async fn list_session_records(
     session_key: &str,
     limit: usize,
 ) -> Result<Vec<ChannelSessionRecord>, ServiceError> {
-    let (endpoint, gateway_token) = resolve_session_records_context(state, tenant).await?;
-    let mut request = state.http_client.post(endpoint).json(&json!({
+    let (route_base, gateway_token) = resolve_session_records_context(state, tenant).await?;
+    let payload = json!({
         "sessionKey": session_key,
         "limit": limit.max(1),
-    }));
+    });
+
+    let rest_endpoint = build_list_session_records_endpoint(&route_base)?;
+    match request_session_records(state, &rest_endpoint, gateway_token.as_deref(), &payload).await {
+        Ok(records) => Ok(records),
+        Err(err) if should_retry_with_method_route(&err) => {
+            let method_endpoint = build_list_session_records_method_endpoint(&route_base)?;
+            request_session_records(state, &method_endpoint, gateway_token.as_deref(), &payload)
+                .await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn resolve_session_records_context(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+) -> Result<(String, Option<String>), ServiceError> {
+    let credential = tenant.credential.read().await.clone();
+    let gateway_url = credential
+        .lowcode_ws_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ServiceError::BadRequest("租户未配置 gateway_url".to_string()))?;
+    let route_base = normalize_gateway_route_base(gateway_url)?;
+    let gateway_token = credential.lowcode_ws_token.clone().or_else(|| {
+        state
+            .config
+            .channel_gateway
+            .inbound_token
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+    });
+    Ok((route_base, gateway_token))
+}
+
+fn normalize_gateway_route_base(gateway_url: &str) -> Result<String, ServiceError> {
+    let trimmed = gateway_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(ServiceError::BadRequest(
+            "租户未配置 gateway_url".to_string(),
+        ));
+    }
+
+    let route_base = if trimmed.ends_with("/inbound") {
+        trimmed.trim_end_matches("/inbound").trim_end_matches('/')
+    } else {
+        trimmed
+    };
+
+    if route_base.is_empty() {
+        return Err(ServiceError::BadRequest(
+            "租户未配置 gateway_url".to_string(),
+        ));
+    }
+
+    Ok(route_base.to_string())
+}
+
+pub fn build_list_session_records_endpoint(gateway_url: &str) -> Result<String, ServiceError> {
+    let route_base = normalize_gateway_route_base(gateway_url)?;
+    Ok(format!("{route_base}/{LIST_SESSION_RECORDS_PATH}"))
+}
+
+pub fn build_list_session_records_method_endpoint(
+    gateway_url: &str,
+) -> Result<String, ServiceError> {
+    let route_base = normalize_gateway_route_base(gateway_url)?;
+    Ok(format!("{route_base}/{LIST_SESSION_RECORDS_METHOD}"))
+}
+
+async fn request_session_records(
+    state: &Arc<AppState>,
+    endpoint: &str,
+    gateway_token: Option<&str>,
+    payload: &serde_json::Value,
+) -> Result<Vec<ChannelSessionRecord>, ServiceError> {
+    let mut request = state.http_client.post(endpoint).json(payload);
     if let Some(token) = gateway_token {
         request = request.bearer_auth(token);
     }
@@ -54,50 +133,12 @@ pub async fn list_session_records(
     })
 }
 
-async fn resolve_session_records_context(
-    state: &Arc<AppState>,
-    tenant: &Arc<TenantContext>,
-) -> Result<(String, Option<String>), ServiceError> {
-    let credential = tenant.credential.read().await.clone();
-    let gateway_url = credential
-        .lowcode_ws_base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| ServiceError::BadRequest("租户未配置 gateway_url".to_string()))?;
-    let endpoint = build_list_session_records_endpoint(gateway_url)?;
-    let gateway_token = credential.lowcode_ws_token.clone().or_else(|| {
-        state
-            .config
-            .channel_gateway
-            .inbound_token
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-    });
-    Ok((endpoint, gateway_token))
-}
-
-pub fn build_list_session_records_endpoint(gateway_url: &str) -> Result<String, ServiceError> {
-    let trimmed = gateway_url.trim().trim_end_matches('/');
-    if trimmed.is_empty() {
-        return Err(ServiceError::BadRequest(
-            "租户未配置 gateway_url".to_string(),
-        ));
-    }
-
-    let route_base = if trimmed.ends_with("/inbound") {
-        trimmed.trim_end_matches("/inbound").trim_end_matches('/')
-    } else {
-        trimmed
+fn should_retry_with_method_route(err: &ServiceError) -> bool {
+    let message = match err {
+        ServiceError::BadRequest(message) | ServiceError::Upstream(message) => message,
+        _ => return false,
     };
-
-    if route_base.is_empty() {
-        return Err(ServiceError::BadRequest(
-            "租户未配置 gateway_url".to_string(),
-        ));
-    }
-
-    Ok(format!("{route_base}/{LIST_SESSION_RECORDS_PATH}"))
+    message.contains("Invalid path format") && message.contains("expected /method_name")
 }
 
 fn map_gateway_error(status: u16, raw_body: &str, prefix: &str) -> ServiceError {
@@ -135,7 +176,11 @@ fn extract_gateway_error_message(value: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_list_session_records_endpoint;
+    use super::{
+        build_list_session_records_endpoint, build_list_session_records_method_endpoint,
+        should_retry_with_method_route,
+    };
+    use crate::error::ServiceError;
 
     #[test]
     fn builds_session_list_endpoint_from_standard_channel_route() {
@@ -166,5 +211,26 @@ mod tests {
                 .unwrap(),
             "https://gateway.example.com/svc-channel-gateway/sessions/list"
         );
+    }
+
+    #[test]
+    fn builds_session_list_method_endpoint_from_service_route() {
+        assert_eq!(
+            build_list_session_records_method_endpoint(
+                "https://gateway.example.com/svc-channel-gateway/inbound"
+            )
+            .unwrap(),
+            "https://gateway.example.com/svc-channel-gateway/listSessions"
+        );
+    }
+
+    #[test]
+    fn retries_with_method_route_for_invalid_path_format() {
+        assert!(should_retry_with_method_route(&ServiceError::Upstream(
+            "查询 channel-gateway 会话列表失败: status=400 body=Invalid path format: /svc/sessions/list, expected /method_name or /service_name/method_name".to_string(),
+        )));
+        assert!(!should_retry_with_method_route(&ServiceError::BadRequest(
+            "sessionKey不能为空".to_string(),
+        )));
     }
 }

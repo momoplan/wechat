@@ -251,7 +251,7 @@ curl -X PUT http://127.0.0.1:3211/tenants/demo/command-actions \
 - `call` 的 `params` 必须是 JSON 对象
 - `service` / `method` / `params` 只有 `action=call` 时允许提供
 - 命令仍然按整条文本精确匹配
-- 会话类本地命令当前依赖标准 channel 路由形式的 `gateway_url`，例如 `/workspaces/{workspace}/channels/wechat`
+- 会话类本地命令会基于租户 `gateway_url` 推导查询地址：若以 `/inbound` 结尾会先去掉，再拼 `/sessions/list`
 
 删除租户自定义命令并恢复默认：
 

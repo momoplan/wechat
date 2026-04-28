@@ -4,7 +4,6 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-const WECHAT_CHANNEL_NAME: &str = "wechat";
 const LIST_SESSION_RECORDS_PATH: &str = "sessions/list";
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -92,13 +91,13 @@ pub fn build_list_session_records_endpoint(gateway_url: &str) -> Result<String, 
         trimmed
     };
 
-    if route_base.contains("/workspaces/") && route_base.contains("/channels/") {
-        return Ok(format!("{route_base}/{LIST_SESSION_RECORDS_PATH}"));
+    if route_base.is_empty() {
+        return Err(ServiceError::BadRequest(
+            "租户未配置 gateway_url".to_string(),
+        ));
     }
 
-    Err(ServiceError::BadRequest(format!(
-        "gateway_url 必须是标准 channel-gateway 渠道路由，例如 /workspaces/{{workspace}}/channels/{WECHAT_CHANNEL_NAME}"
-    )))
+    Ok(format!("{route_base}/{LIST_SESSION_RECORDS_PATH}"))
 }
 
 fn map_gateway_error(status: u16, raw_body: &str, prefix: &str) -> ServiceError {
@@ -161,12 +160,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_legacy_non_workspace_gateway_route() {
-        let err = build_list_session_records_endpoint("http://127.0.0.1:4020/channels/wechat")
-            .expect_err("expected invalid gateway route");
-        assert!(
-            err.to_string()
-                .contains("/workspaces/{workspace}/channels/wechat")
+    fn builds_session_list_endpoint_from_service_route() {
+        assert_eq!(
+            build_list_session_records_endpoint("https://gateway.example.com/svc-channel-gateway")
+                .unwrap(),
+            "https://gateway.example.com/svc-channel-gateway/sessions/list"
         );
     }
 }

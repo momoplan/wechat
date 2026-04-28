@@ -70,6 +70,18 @@ pub fn scope() -> Scope {
         .service(super::compat::scope())
         .service(super::external_module::scope())
         .route("/health", web::get().to(health))
+        .route(
+            "/defaults/command-actions",
+            web::get().to(get_default_command_actions),
+        )
+        .route(
+            "/defaults/command-actions",
+            web::put().to(update_default_command_actions),
+        )
+        .route(
+            "/defaults/command-actions",
+            web::delete().to(delete_default_command_actions),
+        )
         .route("/tenants", web::get().to(list_tenants))
         .route("/tenants/{tenant_id}", web::get().to(get_tenant))
         .route("/tenants/{tenant_id}", web::put().to(upsert_tenant))
@@ -287,8 +299,8 @@ async fn get_command_actions(
     let (command_actions, source) = match configured {
         Some(items) => (items, "tenant"),
         None => (
-            state.config.runtime.command_actions.clone(),
-            "runtime-default",
+            state.effective_default_command_actions().await,
+            state.default_command_actions_source().await,
         ),
     };
     Ok(HttpResponse::Ok().json(CommandActionsResponse {
@@ -354,9 +366,45 @@ async fn delete_command_actions(
             .assistant_name
             .clone()
             .unwrap_or_else(|| state.config.runtime.assistant_name.clone()),
-        command_actions: state.config.runtime.command_actions.clone(),
-        source: "runtime-default".to_string(),
+        command_actions: state.effective_default_command_actions().await,
+        source: state.default_command_actions_source().await.to_string(),
     }))
+}
+
+async fn get_default_command_actions(
+    state: web::Data<Arc<AppState>>,
+) -> Result<HttpResponse, ServiceError> {
+    Ok(HttpResponse::Ok().json(json!({
+        "assistantName": state.config.runtime.assistant_name,
+        "commandActions": state.effective_default_command_actions().await,
+        "source": state.default_command_actions_source().await
+    })))
+}
+
+async fn update_default_command_actions(
+    state: web::Data<Arc<AppState>>,
+    payload: web::Json<CommandActionsUpdateRequest>,
+) -> Result<HttpResponse, ServiceError> {
+    let command_actions = normalize_command_actions(payload.into_inner().command_actions)?;
+    state
+        .update_runtime_default_command_actions(Some(command_actions.clone()))
+        .await?;
+    Ok(HttpResponse::Ok().json(json!({
+        "assistantName": state.config.runtime.assistant_name,
+        "commandActions": command_actions,
+        "source": "global-default"
+    })))
+}
+
+async fn delete_default_command_actions(
+    state: web::Data<Arc<AppState>>,
+) -> Result<HttpResponse, ServiceError> {
+    state.update_runtime_default_command_actions(None).await?;
+    Ok(HttpResponse::Ok().json(json!({
+        "assistantName": state.config.runtime.assistant_name,
+        "commandActions": state.effective_default_command_actions().await,
+        "source": "code-default"
+    })))
 }
 
 async fn start_connection(

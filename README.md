@@ -20,7 +20,7 @@
 - 这不是仓库内能对应到的微信公开标准开放平台 Bot API，建议先按内测/PoC 使用。
 - 当前会话模型只支持私聊：`sessionKey = wechat:dm:<user_id>`。
 - 微信用户发送命中“助手名称 + 命令文本”的精确文本命令时，服务会优先按命令动作处理；其中 `new/abort/activate/call` 会转成 `session-control` 发给 channel-gateway，`list_sessions/list_commands` 由 wechat 本地直接处理并回复。
-- 命令配置优先读取租户级动态配置；未配置时回退到 `runtime.command_actions` 默认值。
+- 命令配置优先读取租户级动态配置；未配置时回退到管理接口维护的全局默认命令；若全局默认未配置，再回退到代码内置默认值。
 - 助手名称优先读取租户级 `assistantName`；未配置时回退到 `runtime.assistant_name` 默认值。
 
 ## 架构
@@ -167,7 +167,34 @@ curl -X PUT http://127.0.0.1:3211/tenants/demo/assistant-name \
 curl -X DELETE http://127.0.0.1:3211/tenants/demo/assistant-name
 ```
 
-读取当前生效命令：
+读取全局默认命令：
+
+```bash
+curl http://127.0.0.1:3211/defaults/command-actions
+```
+
+更新全局默认命令：
+
+```bash
+curl -X PUT http://127.0.0.1:3211/defaults/command-actions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "commandActions": [
+      { "text": "新话题", "action": "new" },
+      { "text": "结束当前会话", "action": "abort" },
+      { "text": "命令列表", "action": "list_commands" },
+      { "text": "列会话", "action": "list_sessions" }
+    ]
+  }'
+```
+
+删除全局默认命令并回退到代码内置默认值：
+
+```bash
+curl -X DELETE http://127.0.0.1:3211/defaults/command-actions
+```
+
+读取租户当前生效命令：
 
 ```bash
 curl http://127.0.0.1:3211/tenants/demo/command-actions
@@ -175,7 +202,8 @@ curl http://127.0.0.1:3211/tenants/demo/command-actions
 
 返回里会带：
 - `source=tenant`：当前使用租户自定义命令
-- `source=runtime-default`：当前回退到进程默认命令
+- `source=global-default`：当前回退到数据库里的全局默认命令
+- `source=code-default`：当前回退到代码内置默认命令
 - `assistantName`：当前生效的助手名称
 
 租户详情接口 `GET /tenants/{tenant_id}` 返回的 `tenant.assistant_name` 也是当前生效值；如果租户没单独配置，会直接返回默认助手名称。

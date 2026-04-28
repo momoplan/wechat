@@ -1,4 +1,4 @@
-use crate::config::DatabaseConfig;
+use crate::config::{CommandActionConfig, DatabaseConfig};
 use crate::models::TenantCredential;
 use anyhow::{Context, Result};
 use sqlx::Row;
@@ -9,6 +9,11 @@ use std::time::Duration;
 pub struct PersistedTenant {
     pub tenant_id: String,
     pub credential: TenantCredential,
+}
+
+#[derive(Debug, Clone)]
+pub struct PersistedRuntimeDefaults {
+    pub command_actions: Option<Vec<CommandActionConfig>>,
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +65,45 @@ impl TenantStore {
             });
         }
         Ok(out)
+    }
+
+    pub async fn get_runtime_defaults(&self) -> Result<PersistedRuntimeDefaults> {
+        let row = sqlx::query(
+            "SELECT command_actions_json FROM wechat_runtime_defaults WHERE config_key = 'global' LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .context("查询 wechat_runtime_defaults 失败")?;
+
+        let Some(row) = row else {
+            return Ok(PersistedRuntimeDefaults {
+                command_actions: None,
+            });
+        };
+
+        Ok(PersistedRuntimeDefaults {
+            command_actions: parse_command_actions_json(row.get("command_actions_json"))?,
+        })
+    }
+
+    pub async fn update_runtime_default_command_actions(
+        &self,
+        command_actions: Option<&[CommandActionConfig]>,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO wechat_runtime_defaults (config_key, command_actions_json)
+            VALUES ('global', ?)
+            ON DUPLICATE KEY UPDATE
+              command_actions_json = VALUES(command_actions_json),
+              updated_at = CURRENT_TIMESTAMP
+            "#,
+        )
+        .bind(serialize_command_actions_json(command_actions)?)
+        .execute(&self.pool)
+        .await
+        .context("更新 wechat_runtime_defaults.command_actions_json 失败")?;
+        Ok(())
     }
 
     pub async fn upsert_tenant(
@@ -157,6 +201,19 @@ impl TenantStore {
         .await
         .context("初始化 wechat_tenant_credentials 表失败")?;
 
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS wechat_runtime_defaults (
+              config_key VARCHAR(32) PRIMARY KEY,
+              command_actions_json TEXT NULL,
+              updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .context("初始化 wechat_runtime_defaults 表失败")?;
+
         self.add_column_if_missing(
             "ALTER TABLE wechat_tenant_credentials ADD COLUMN bot_token VARCHAR(255) NULL",
             "bot_token",
@@ -214,6 +271,11 @@ impl TenantStore {
         .await?;
         self.add_column_if_missing(
             "ALTER TABLE wechat_tenant_credentials ADD COLUMN command_actions_json TEXT NULL",
+            "command_actions_json",
+        )
+        .await?;
+        self.add_column_if_missing(
+            "ALTER TABLE wechat_runtime_defaults ADD COLUMN command_actions_json TEXT NULL",
             "command_actions_json",
         )
         .await?;

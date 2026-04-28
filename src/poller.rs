@@ -202,13 +202,10 @@ async fn handle_inbound_message(state: &Arc<AppState>, tenant: &Arc<TenantContex
 
     let inbound_content = build_lowcode_inbound_content(&msg);
     let has_media = has_media_items(&msg);
-    let command_actions = tenant
-        .credential
-        .read()
-        .await
-        .command_actions
-        .clone()
-        .unwrap_or_else(|| state.config.runtime.command_actions.clone());
+    let command_actions = match tenant.credential.read().await.command_actions.clone() {
+        Some(items) => items,
+        None => state.effective_default_command_actions().await,
+    };
     let assistant_name = tenant
         .credential
         .read()
@@ -1060,11 +1057,13 @@ async fn handle_local_list_commands_command(
         .assistant_name
         .clone()
         .unwrap_or_else(|| state.config.runtime.assistant_name.clone());
-    let command_actions = credential
-        .command_actions
-        .clone()
-        .unwrap_or_else(|| state.config.runtime.command_actions.clone());
+    let command_actions = credential.command_actions.clone();
     drop(credential);
+
+    let command_actions = match command_actions {
+        Some(items) => items,
+        None => state.effective_default_command_actions().await,
+    };
 
     let reply_text = build_command_list_text(&assistant_name, &command_actions);
     if let Err(err) =

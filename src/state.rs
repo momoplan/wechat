@@ -1,4 +1,4 @@
-use crate::config::AppConfig;
+use crate::config::{AppConfig, CommandActionConfig};
 use crate::error::ServiceError;
 use crate::models::{
     ConnectionStatus, ReceivedEvent, TenantCredential, TenantSummary, mask_secret,
@@ -285,6 +285,7 @@ pub struct AppState {
     pub http_client: reqwest::Client,
     pub tenant_store: TenantStore,
     pub tenants: DashMap<String, Arc<TenantContext>>,
+    pub runtime_default_command_actions: RwLock<Option<Vec<CommandActionConfig>>>,
 }
 
 impl AppState {
@@ -299,13 +300,43 @@ impl AppState {
             .expect("failed to create reqwest client");
 
         let tenant_store = TenantStore::new(&config.database).await?;
+        let defaults = tenant_store.get_runtime_defaults().await?;
 
         Ok(Self {
             tenant_store,
             config,
             http_client,
             tenants: DashMap::new(),
+            runtime_default_command_actions: RwLock::new(defaults.command_actions),
         })
+    }
+
+    pub async fn effective_default_command_actions(&self) -> Vec<CommandActionConfig> {
+        self.runtime_default_command_actions
+            .read()
+            .await
+            .clone()
+            .unwrap_or_else(|| self.config.runtime.command_actions.clone())
+    }
+
+    pub async fn default_command_actions_source(&self) -> &'static str {
+        if self.runtime_default_command_actions.read().await.is_some() {
+            "global-default"
+        } else {
+            "code-default"
+        }
+    }
+
+    pub async fn update_runtime_default_command_actions(
+        &self,
+        command_actions: Option<Vec<CommandActionConfig>>,
+    ) -> Result<(), ServiceError> {
+        self.tenant_store
+            .update_runtime_default_command_actions(command_actions.as_deref())
+            .await?;
+        let mut guard = self.runtime_default_command_actions.write().await;
+        *guard = command_actions;
+        Ok(())
     }
 
     pub fn get_tenant(&self, tenant_id: &str) -> Option<Arc<TenantContext>> {

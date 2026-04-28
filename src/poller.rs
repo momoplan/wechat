@@ -20,6 +20,7 @@ const LOWCODE_FORWARD_FALLBACK_MESSAGE: &str = "消息暂时处理失败，请�
 const LOWCODE_FORWARD_PAYLOAD_TOO_LARGE_MESSAGE: &str =
     "这张图片太大，当前无法直接处理。请先压缩图片后重试，或改为发送图片链接。";
 const WECHAT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
+const ACTIVATE_RECENT_ACTION: &str = "activate_recent";
 // Base64 内联会把图片体积放大约 33%，这里额外留一部分 JSON 包体余量，
 // 避免在上游链路较紧的 body limit 下把 /inbound 请求直接撑爆。
 const MAX_TRANSPORT_INLINE_IMAGE_BYTES: usize = 80 * 1024;
@@ -33,6 +34,7 @@ struct InboundCommand {
     action: String,
     agent_config_id: Option<String>,
     session_id: Option<String>,
+    recent_session_index: Option<usize>,
     service: Option<String>,
     method: Option<String>,
     params: Option<Value>,
@@ -330,13 +332,14 @@ fn detect_inbound_command(
 
     let assistant_name = normalize_assistant_name(assistant_name)?;
     let text = normalize_command_text(content, &assistant_name)?;
-    command_actions.iter().find_map(|item| {
+    if let Some(command) = command_actions.iter().find_map(|item| {
         if text.eq_ignore_ascii_case(item.text.as_str()) {
             Some(InboundCommand {
                 text: text.clone(),
                 action: item.action.clone(),
                 agent_config_id: item.agent_config_id.clone(),
                 session_id: item.session_id.clone(),
+                recent_session_index: None,
                 service: item.service.clone(),
                 method: item.method.clone(),
                 params: item.params.clone(),
@@ -344,6 +347,19 @@ fn detect_inbound_command(
         } else {
             None
         }
+    }) {
+        return Some(command);
+    }
+
+    parse_recent_session_index(&text).map(|index| InboundCommand {
+        text,
+        action: ACTIVATE_RECENT_ACTION.to_string(),
+        agent_config_id: None,
+        session_id: None,
+        recent_session_index: Some(index),
+        service: None,
+        method: None,
+        params: None,
     })
 }
 
@@ -372,6 +388,15 @@ fn normalize_command_text(text: &str, assistant_name: &str) -> Option<String> {
     } else {
         Some(command.to_string())
     }
+}
+
+fn parse_recent_session_index(text: &str) -> Option<usize> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let index = trimmed.parse::<usize>().ok()?;
+    (index > 0).then_some(index)
 }
 
 fn build_lowcode_inbound_content(msg: &Value) -> Option<Value> {
@@ -771,11 +796,54 @@ async fn maybe_forward_to_lowcode_agent(
     inbound_command: Option<InboundCommand>,
     context_token: Option<&str>,
 ) {
-    if let Some(command) = inbound_command.as_ref() {
+    let inbound_command = if let Some(command) = inbound_command {
         if command.action.eq_ignore_ascii_case("list_sessions") {
-            handle_local_list_sessions_command(state, tenant, user_id, context_token, command)
+            handle_local_list_sessions_command(state, tenant, user_id, context_token, &command)
                 .await;
             return;
+        }
+        if command.action.eq_ignore_ascii_case(ACTIVATE_RECENT_ACTION) {
+            match resolve_recent_session_activate_command(state, tenant, user_id, &command).await {
+                Ok(resolved) => Some(resolved),
+                Err(err) => {
+                    warn!(
+                        tenant_id = %tenant.tenant_id,
+                        user_id,
+                        action = %command.action,
+                        error = %err,
+                        "按序号切换微信会话失败"
+                    );
+                    let reply_text = build_local_command_error_message(&err);
+                    if let Err(send_err) = wechat_api::send_text_to_user(
+                        state,
+                        tenant,
+                        user_id,
+                        &reply_text,
+                        context_token,
+                    )
+                    .await
+                    {
+                        warn!(
+                            tenant_id = %tenant.tenant_id,
+                            user_id,
+                            action = %command.action,
+                            error = %send_err,
+                            "微信本地切换会话失败提示发送失败"
+                        );
+                    }
+                    return;
+                }
+            }
+        } else {
+            Some(command)
+        }
+    } else {
+        None
+    };
+
+    if let Some(command) = inbound_command.as_ref() {
+        if command.action.eq_ignore_ascii_case("list_sessions") {
+            unreachable!("list_sessions should have been handled locally before forwarding");
         }
     }
 
@@ -975,6 +1043,57 @@ async fn handle_local_list_sessions_command(
     }
 }
 
+async fn resolve_recent_session_activate_command(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    user_id: &str,
+    command: &InboundCommand,
+) -> Result<InboundCommand, crate::error::ServiceError> {
+    let requested_index = command.recent_session_index.ok_or_else(|| {
+        crate::error::ServiceError::BadRequest(
+            "切换会话序号无效，请先发送“列会话”查看可用序号。".to_string(),
+        )
+    })?;
+    let session_key = format!("wechat:dm:{user_id}");
+    let records = channel_session_client::list_session_records(
+        state,
+        tenant,
+        &session_key,
+        SESSION_LIST_COMMAND_LIMIT,
+    )
+    .await?;
+    let record = resolve_recent_session_record(&records, requested_index)?;
+
+    Ok(InboundCommand {
+        text: command.text.clone(),
+        action: "activate".to_string(),
+        agent_config_id: None,
+        session_id: Some(record.session_id.clone()),
+        recent_session_index: None,
+        service: None,
+        method: None,
+        params: None,
+    })
+}
+
+fn resolve_recent_session_record(
+    records: &[ChannelSessionRecord],
+    index: usize,
+) -> Result<&ChannelSessionRecord, crate::error::ServiceError> {
+    if records.is_empty() {
+        return Err(crate::error::ServiceError::BadRequest(
+            "当前还没有历史会话，请先发送“小百 列会话”确认最近会话。".to_string(),
+        ));
+    }
+    if index == 0 || index > records.len() {
+        return Err(crate::error::ServiceError::BadRequest(format!(
+            "最近会话里只有 {} 个，请先发送“小百 列会话”查看可用序号。",
+            records.len()
+        )));
+    }
+    Ok(&records[index - 1])
+}
+
 async fn maybe_reply_session_control_success(
     state: &Arc<AppState>,
     tenant: &Arc<TenantContext>,
@@ -1089,7 +1208,7 @@ fn build_session_list_text(records: &[ChannelSessionRecord]) -> String {
             lines.push(format!("预览：{}", truncate_preview(&preview, 60)));
         }
     }
-    lines.push("可用已配置的切换命令切到指定会话。".to_string());
+    lines.push("发送“助手名 + 序号”可直接切换，例如：小百 2".to_string());
     lines.join("\n")
 }
 
@@ -1190,12 +1309,13 @@ fn session_control_success_reply_text(action: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InboundCommand, SessionControlSuccess, build_lowcode_inbound_content,
+        ACTIVATE_RECENT_ACTION, InboundCommand, SessionControlSuccess, build_lowcode_inbound_content,
         build_session_list_text, build_wechat_cdn_download_url, decode_wechat_aes_key_hex,
         decrypt_aes_ecb, detect_inbound_command, effective_inline_image_max_bytes,
         extract_session_control_success, extract_wechat_media_aes_key, guess_image_mime_type,
         has_media_items, mark_image_part_transfer, normalize_assistant_name,
         normalize_command_text, normalize_image_content_type, normalize_preview_text,
+        parse_recent_session_index, resolve_recent_session_record,
         session_control_success_reply_text, convert_image_part_to_file_fallback,
     };
     use crate::channel_session_client::ChannelSessionRecord;
@@ -1482,6 +1602,7 @@ mod tests {
                 action: "new".to_string(),
                 agent_config_id: None,
                 session_id: None,
+                recent_session_index: None,
                 service: None,
                 method: None,
                 params: None,
@@ -1494,6 +1615,7 @@ mod tests {
                 action: "new".to_string(),
                 agent_config_id: None,
                 session_id: None,
+                recent_session_index: None,
                 service: None,
                 method: None,
                 params: None,
@@ -1557,6 +1679,7 @@ mod tests {
                 action: "new".to_string(),
                 agent_config_id: None,
                 session_id: None,
+                recent_session_index: None,
                 service: None,
                 method: None,
                 params: None,
@@ -1586,6 +1709,7 @@ mod tests {
                 action: "abort".to_string(),
                 agent_config_id: None,
                 session_id: None,
+                recent_session_index: None,
                 service: None,
                 method: None,
                 params: None,
@@ -1611,6 +1735,7 @@ mod tests {
                 action: "activate".to_string(),
                 agent_config_id: None,
                 session_id: Some("sess_order_123".to_string()),
+                recent_session_index: None,
                 service: None,
                 method: None,
                 params: None,
@@ -1638,6 +1763,7 @@ mod tests {
                 action: "call".to_string(),
                 agent_config_id: None,
                 session_id: None,
+                recent_session_index: None,
                 service: Some("crm-service".to_string()),
                 method: Some("getPoints".to_string()),
                 params: Some(json!({
@@ -1665,6 +1791,7 @@ mod tests {
                 action: "new".to_string(),
                 agent_config_id: Some("agent_20001".to_string()),
                 session_id: None,
+                recent_session_index: None,
                 service: None,
                 method: None,
                 params: None,
@@ -1690,6 +1817,24 @@ mod tests {
                 action: "list_sessions".to_string(),
                 agent_config_id: None,
                 session_id: None,
+                recent_session_index: None,
+                service: None,
+                method: None,
+                params: None,
+            })
+        );
+    }
+
+    #[test]
+    fn detects_recent_session_index_command() {
+        assert_eq!(
+            detect_inbound_command(Some(1), "小百 2", false, "小百", &[]),
+            Some(InboundCommand {
+                text: "2".to_string(),
+                action: ACTIVATE_RECENT_ACTION.to_string(),
+                agent_config_id: None,
+                session_id: None,
+                recent_session_index: Some(2),
                 service: None,
                 method: None,
                 params: None,
@@ -1710,6 +1855,14 @@ mod tests {
         );
         assert_eq!(normalize_command_text("新话题", "小百"), None);
         assert_eq!(normalize_command_text("小百", "小百"), None);
+    }
+
+    #[test]
+    fn parses_recent_session_index_from_numeric_text() {
+        assert_eq!(parse_recent_session_index("1"), Some(1));
+        assert_eq!(parse_recent_session_index(" 12 "), Some(12));
+        assert_eq!(parse_recent_session_index("0"), None);
+        assert_eq!(parse_recent_session_index("abc"), None);
     }
 
     #[test]
@@ -1792,6 +1945,38 @@ mod tests {
         assert!(text.contains("1. sess_current [当前]"));
         assert!(text.contains("2. sess_old"));
         assert!(text.contains("预览：你好 继续"));
+        assert!(text.contains("小百 2"));
+    }
+
+    #[test]
+    fn resolves_recent_session_record_by_one_based_index() {
+        let records = vec![
+            ChannelSessionRecord {
+                session_id: "sess_current".to_string(),
+                created_at_unix: 1_700_000_000,
+                last_active_at_unix: 1_700_000_100,
+                is_current: true,
+                message_count: 12,
+                latest_message_preview: Some("你好".to_string()),
+            },
+            ChannelSessionRecord {
+                session_id: "sess_old".to_string(),
+                created_at_unix: 1_699_999_000,
+                last_active_at_unix: 1_699_999_100,
+                is_current: false,
+                message_count: 3,
+                latest_message_preview: None,
+            },
+        ];
+
+        assert_eq!(
+            resolve_recent_session_record(&records, 2)
+                .expect("should resolve by one-based index")
+                .session_id,
+            "sess_old"
+        );
+        assert!(resolve_recent_session_record(&records, 0).is_err());
+        assert!(resolve_recent_session_record(&records, 3).is_err());
     }
 
     #[test]

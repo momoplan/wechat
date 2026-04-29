@@ -17,6 +17,13 @@ pub struct ChannelSessionRecord {
     pub latest_message_preview: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ChannelSessionRecordsEnvelope {
+    #[serde(default)]
+    data: Vec<ChannelSessionRecord>,
+}
+
 pub async fn list_session_records(
     state: &Arc<AppState>,
     tenant: &Arc<TenantContext>,
@@ -109,11 +116,23 @@ async fn request_session_records(
         ));
     }
 
-    serde_json::from_str::<Vec<ChannelSessionRecord>>(&raw_body).map_err(|err| {
-        ServiceError::Upstream(format!(
-            "解析 channel-gateway 会话列表响应失败: {err}; body={raw_body}"
-        ))
-    })
+    parse_session_records_response(&raw_body)
+}
+
+fn parse_session_records_response(
+    raw_body: &str,
+) -> Result<Vec<ChannelSessionRecord>, ServiceError> {
+    if let Ok(records) = serde_json::from_str::<Vec<ChannelSessionRecord>>(raw_body) {
+        return Ok(records);
+    }
+
+    if let Ok(envelope) = serde_json::from_str::<ChannelSessionRecordsEnvelope>(raw_body) {
+        return Ok(envelope.data);
+    }
+
+    Err(ServiceError::Upstream(format!(
+        "解析 channel-gateway 会话列表响应失败: body={raw_body}"
+    )))
 }
 
 fn map_gateway_error(status: u16, raw_body: &str, prefix: &str) -> ServiceError {
@@ -151,7 +170,9 @@ fn extract_gateway_error_message(value: &serde_json::Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_list_session_records_endpoint;
+    use super::{
+        ChannelSessionRecord, build_list_session_records_endpoint, parse_session_records_response,
+    };
 
     #[test]
     fn builds_session_list_endpoint_from_standard_channel_route() {
@@ -182,5 +203,23 @@ mod tests {
                 .unwrap(),
             "https://gateway.example.com/svc-channel-gateway/listSessions"
         );
+    }
+
+    #[test]
+    fn parses_session_records_from_plain_array_or_envelope() {
+        let expected = vec![ChannelSessionRecord {
+            session_id: "sess_1".to_string(),
+            created_at_unix: 1,
+            last_active_at_unix: 2,
+            is_current: true,
+            message_count: 3,
+            latest_message_preview: Some("hi".to_string()),
+        }];
+
+        let plain = r#"[{"sessionId":"sess_1","createdAtUnix":1,"lastActiveAtUnix":2,"isCurrent":true,"messageCount":3,"latestMessagePreview":"hi"}]"#;
+        assert_eq!(parse_session_records_response(plain).unwrap(), expected);
+
+        let wrapped = r#"{"data":[{"sessionId":"sess_1","createdAtUnix":1,"lastActiveAtUnix":2,"isCurrent":true,"messageCount":3,"latestMessagePreview":"hi"}],"errorCode":"0","value":"成功"}"#;
+        assert_eq!(parse_session_records_response(wrapped).unwrap(), expected);
     }
 }

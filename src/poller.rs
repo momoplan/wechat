@@ -954,6 +954,28 @@ async fn maybe_forward_to_lowcode_agent(
             let status = response.status();
             let response_text = response.text().await.unwrap_or_default();
             let response_body = serde_json::from_str::<Value>(&response_text).ok();
+            let gateway_ok = response_body
+                .as_ref()
+                .map(channel_gateway_response_is_success)
+                .unwrap_or(true);
+            if !gateway_ok {
+                warn!(
+                    tenant_id = %tenant.tenant_id,
+                    user_id,
+                    status = %status,
+                    body = %response_text,
+                    "channel-gateway 返回业务失败"
+                );
+                reply_lowcode_forward_failure(
+                    state,
+                    tenant,
+                    user_id,
+                    context_token,
+                    Some(status.as_u16()),
+                )
+                .await;
+                return;
+            }
             info!(
                 tenant_id = %tenant.tenant_id,
                 user_id,
@@ -1216,6 +1238,15 @@ fn build_lowcode_inbound_endpoint(base_url: &str) -> String {
     }
 }
 
+fn channel_gateway_response_is_success(payload: &Value) -> bool {
+    payload
+        .get("errorCode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(|code| code == "0")
+        .unwrap_or(true)
+}
+
 fn build_session_list_text(records: &[ChannelSessionRecord]) -> String {
     if records.is_empty() {
         return "当前还没有历史会话。".to_string();
@@ -1367,8 +1398,9 @@ mod tests {
     use super::{
         ACTIVATE_RECENT_ACTION, InboundCommand, SessionControlSuccess, build_command_list_text,
         build_lowcode_inbound_content, build_session_list_text, build_wechat_cdn_download_url,
-        convert_image_part_to_file_fallback, decode_wechat_aes_key_hex, decrypt_aes_ecb,
-        detect_inbound_command, effective_inline_image_max_bytes, extract_session_control_success,
+        channel_gateway_response_is_success, convert_image_part_to_file_fallback,
+        decode_wechat_aes_key_hex, decrypt_aes_ecb, detect_inbound_command,
+        effective_inline_image_max_bytes, extract_session_control_success,
         extract_wechat_media_aes_key, guess_image_mime_type, has_media_items,
         mark_image_part_transfer, normalize_assistant_name, normalize_command_text,
         normalize_image_content_type, normalize_preview_text, parse_recent_session_index,
@@ -1972,6 +2004,18 @@ mod tests {
             Some("已切换到指定会话，可以继续发送消息了。")
         );
         assert_eq!(session_control_success_reply_text("abort"), None);
+    }
+
+    #[test]
+    fn detects_channel_gateway_business_success_by_error_code() {
+        assert!(channel_gateway_response_is_success(&json!({
+            "errorCode": "0",
+            "value": "success"
+        })));
+        assert!(!channel_gateway_response_is_success(&json!({
+            "errorCode": "UPSTREAM_ERROR",
+            "value": "调用失败"
+        })));
     }
 
     #[test]

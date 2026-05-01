@@ -54,6 +54,12 @@ struct DownloadedImageData {
     mime: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DownloadedMediaData {
+    bytes: Vec<u8>,
+    mime: String,
+}
+
 pub async fn run_tenant_poll_worker(
     state: Arc<AppState>,
     tenant: Arc<TenantContext>,
@@ -249,7 +255,8 @@ async fn handle_inbound_message(state: &Arc<AppState>, tenant: &Arc<TenantContex
         );
         return;
     };
-    let inbound_content = inline_inbound_images(state, tenant, &from_user_id, inbound_content).await;
+    let inbound_content =
+        normalize_inbound_media_parts(state, tenant, &from_user_id, inbound_content).await;
 
     maybe_forward_to_lowcode_agent(
         state,
@@ -524,7 +531,7 @@ fn build_wechat_cdn_download_url(encrypted_query_param: &str) -> String {
     )
 }
 
-async fn inline_inbound_images(
+async fn normalize_inbound_media_parts(
     state: &Arc<AppState>,
     tenant: &Arc<TenantContext>,
     channel_user_id: &str,
@@ -534,13 +541,9 @@ async fn inline_inbound_images(
         return content;
     };
 
-    let max_inline_bytes =
-        effective_inline_image_max_bytes(state.config.runtime.max_inline_image_bytes);
     let mut updated = Vec::with_capacity(parts.len());
     for part in parts {
-        updated.push(
-            inline_image_part(state, tenant, channel_user_id, part.clone(), max_inline_bytes).await,
-        );
+        updated.push(normalize_inbound_media_part(state, tenant, channel_user_id, part.clone()).await);
     }
 
     Value::Array(updated)
@@ -550,26 +553,93 @@ fn effective_inline_image_max_bytes(configured_max: usize) -> usize {
     configured_max.max(1).min(MAX_TRANSPORT_INLINE_IMAGE_BYTES)
 }
 
-async fn inline_image_part(
+async fn normalize_inbound_media_part(
     state: &Arc<AppState>,
     tenant: &Arc<TenantContext>,
     channel_user_id: &str,
     part: Value,
-    max_inline_bytes: usize,
 ) -> Value {
-    let is_image_part = part
-        .get("type")
-        .and_then(Value::as_str)
-        .map(|value| {
-            value.eq_ignore_ascii_case("image_url") || value.eq_ignore_ascii_case("input_image")
-        })
-        .unwrap_or(false);
-    if !is_image_part {
+    let Some(media_descriptor) = classify_inbound_media_part(&part) else {
         return part;
+    };
+
+    if media_descriptor.kind == "image" {
+        let max_inline_bytes =
+            effective_inline_image_max_bytes(state.config.runtime.max_inline_image_bytes);
+        return normalize_inbound_image_part(
+            state,
+            tenant,
+            channel_user_id,
+            part,
+            &media_descriptor.url,
+            max_inline_bytes,
+        )
+        .await;
     }
 
-    let Some(original_url) = part
-        .get("image_url")
+    normalize_inbound_file_part(
+        state,
+        tenant,
+        channel_user_id,
+        part,
+        &media_descriptor.url,
+        media_descriptor.kind,
+    )
+    .await
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboundMediaDescriptor<'a> {
+    kind: &'a str,
+    url: String,
+}
+
+fn classify_inbound_media_part(part: &Value) -> Option<InboundMediaDescriptor<'static>> {
+    let part_type = part
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    let media_kind = part
+        .get("mediaType")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+
+    let url_key = if part_type.eq_ignore_ascii_case("image_url")
+        || part_type.eq_ignore_ascii_case("input_image")
+    {
+        Some("image_url")
+    } else if part_type.eq_ignore_ascii_case("file")
+        || part_type.eq_ignore_ascii_case("file_url")
+        || part_type.eq_ignore_ascii_case("input_file")
+        || part_type.eq_ignore_ascii_case("audio_url")
+        || part_type.eq_ignore_ascii_case("input_audio")
+        || part_type.eq_ignore_ascii_case("voice_url")
+        || part_type.eq_ignore_ascii_case("input_voice")
+        || part_type.eq_ignore_ascii_case("video_url")
+    {
+        Some("file")
+    } else {
+        None
+    }?;
+
+    let kind = if media_kind.eq_ignore_ascii_case("image") || url_key == "image_url" {
+        "image"
+    } else if media_kind.eq_ignore_ascii_case("audio") {
+        "audio"
+    } else if media_kind.eq_ignore_ascii_case("video") {
+        "video"
+    } else {
+        "file"
+    };
+
+    let url = extract_part_url(part, url_key)?;
+    Some(InboundMediaDescriptor { kind, url })
+}
+
+fn extract_part_url(part: &Value, key: &str) -> Option<String> {
+    part.get(key)
         .and_then(|value| match value {
             Value::String(text) => Some(text.as_str()),
             Value::Object(object) => object.get("url").and_then(Value::as_str),
@@ -578,9 +648,17 @@ async fn inline_image_part(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-    else {
-        return part;
-    };
+}
+
+async fn normalize_inbound_image_part(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    channel_user_id: &str,
+    part: Value,
+    original_url: &str,
+    max_inline_bytes: usize,
+) -> Value {
+    let original_url = original_url.to_string();
 
     match download_wechat_image_data(state, &part, &original_url).await {
         Ok(downloaded) if downloaded.bytes.len() <= max_inline_bytes => {
@@ -655,11 +733,63 @@ async fn inline_image_part(
     }
 }
 
+async fn normalize_inbound_file_part(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    channel_user_id: &str,
+    part: Value,
+    original_url: &str,
+    media_kind: &str,
+) -> Value {
+    let original_url = original_url.to_string();
+    match download_wechat_media_data(state, &part, &original_url, media_kind).await {
+        Ok(downloaded) => match upload_wechat_file_part(
+            state,
+            tenant,
+            channel_user_id,
+            &part,
+            &original_url,
+            media_kind,
+            &downloaded,
+        )
+        .await
+        {
+            Ok(uploaded_url) => replace_file_part_url(part, uploaded_url),
+            Err(err) => {
+                warn!(
+                    tenant_id = %tenant.tenant_id,
+                    error = %err,
+                    media_kind,
+                    "微信文件上传失败，保留原始远端地址"
+                );
+                replace_file_part_url(part, original_url)
+            }
+        },
+        Err(err) => {
+            warn!(
+                tenant_id = %tenant.tenant_id,
+                error = %err,
+                media_kind,
+                "微信文件处理失败，保留原始远端地址"
+            );
+            replace_file_part_url(part, original_url)
+        }
+    }
+}
+
 fn replace_image_part_url(mut part: Value, image_url: impl Into<String>) -> Value {
     let Some(object) = part.as_object_mut() else {
         return part;
     };
     object.insert("image_url".to_string(), json!({ "url": image_url.into() }));
+    part
+}
+
+fn replace_file_part_url(mut part: Value, file_url: impl Into<String>) -> Value {
+    let Some(object) = part.as_object_mut() else {
+        return part;
+    };
+    object.insert("file".to_string(), json!({ "url": file_url.into() }));
     part
 }
 
@@ -681,6 +811,22 @@ async fn download_wechat_image_data(
         return Err("IMAGE_TOO_LARGE_BY_CONTENT_LENGTH".to_string());
     }
     finalize_wechat_image_download(part, response).await
+}
+
+async fn download_wechat_media_data(
+    state: &Arc<AppState>,
+    part: &Value,
+    download_url: &str,
+    media_kind: &str,
+) -> Result<DownloadedMediaData, String> {
+    let response = state
+        .http_client
+        .get(download_url)
+        .send()
+        .await
+        .map_err(|err| format!("下载微信文件失败: {err}"))?;
+
+    finalize_wechat_media_download(part, response, media_kind).await
 }
 
 async fn download_wechat_image_data_force(
@@ -728,6 +874,38 @@ async fn finalize_wechat_image_download(
     Ok(DownloadedImageData { bytes, mime })
 }
 
+async fn finalize_wechat_media_download(
+    part: &Value,
+    response: reqwest::Response,
+    media_kind: &str,
+) -> Result<DownloadedMediaData, String> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "(读取微信文件响应失败)".to_string());
+        return Err(format!(
+            "下载微信文件失败 HTTP {}: {}",
+            status.as_u16(),
+            body
+        ));
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToString::to_string);
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|err| format!("读取微信文件失败: {err}"))?;
+    let bytes = maybe_decrypt_wechat_media(part, bytes.as_ref())?;
+    let mime = resolve_media_mime_type(content_type.as_deref(), bytes.as_ref(), media_kind);
+    Ok(DownloadedMediaData { bytes, mime })
+}
+
 fn build_image_data_url(image: &DownloadedImageData) -> String {
     format!(
         "data:{};base64,{}",
@@ -762,7 +940,43 @@ async fn upload_wechat_image_part(
     Ok(uploaded.download_url)
 }
 
+async fn upload_wechat_file_part(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    channel_user_id: &str,
+    part: &Value,
+    original_url: &str,
+    media_kind: &str,
+    downloaded: &DownloadedMediaData,
+) -> Result<String, String> {
+    let binding = channel_binding_client::get_channel_user_binding(state, tenant, channel_user_id)
+        .await
+        .map_err(|err| err.to_string())?;
+    let file_name = build_media_file_name(part, original_url, &downloaded.mime, media_kind);
+    let uploaded = project_file_client::upload_bytes(
+        state,
+        tenant,
+        &binding.workspace_id,
+        channel_user_id,
+        &file_name,
+        &downloaded.mime,
+        &downloaded.bytes,
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(uploaded.download_url)
+}
+
 fn build_image_file_name(part: &Value, original_url: &str, mime: &str) -> String {
+    build_media_file_name(part, original_url, mime, "image")
+}
+
+fn build_media_file_name(
+    part: &Value,
+    original_url: &str,
+    mime: &str,
+    media_kind: &str,
+) -> String {
     let base = part
         .get("wechatMedia")
         .and_then(Value::as_object)
@@ -780,7 +994,7 @@ fn build_image_file_name(part: &Value, original_url: &str, mime: &str) -> String
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string)
         })
-        .unwrap_or_else(|| "wechat_image".to_string());
+        .unwrap_or_else(|| format!("wechat_{media_kind}"));
     if base.contains('.') {
         base
     } else {
@@ -797,7 +1011,19 @@ fn guess_extension_from_mime(mime: &str) -> &'static str {
         "image/bmp" => "bmp",
         "image/svg+xml" => "svg",
         "image/x-icon" => "ico",
-        _ => "png",
+        "audio/amr" => "amr",
+        "audio/wav" => "wav",
+        "audio/x-wav" => "wav",
+        "audio/mpeg" => "mp3",
+        "audio/mp4" => "m4a",
+        "audio/aac" => "aac",
+        "audio/ogg" => "ogg",
+        "audio/opus" => "opus",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        "application/pdf" => "pdf",
+        _ => "bin",
     }
 }
 
@@ -862,6 +1088,65 @@ fn resolve_image_mime_type(content_type: Option<&str>, bytes: &[u8]) -> &'static
     guess_image_mime_type(bytes).unwrap_or("image/png")
 }
 
+fn resolve_media_mime_type(content_type: Option<&str>, bytes: &[u8], media_kind: &str) -> String {
+    if let Some(value) = normalize_media_content_type(content_type, media_kind) {
+        return value.to_string();
+    }
+
+    if media_kind.eq_ignore_ascii_case("image") {
+        return resolve_image_mime_type(content_type, bytes).to_string();
+    }
+
+    if media_kind.eq_ignore_ascii_case("audio") && looks_like_amr(bytes) {
+        return "audio/amr".to_string();
+    }
+
+    if media_kind.eq_ignore_ascii_case("video") && looks_like_mp4(bytes) {
+        return "video/mp4".to_string();
+    }
+
+    "application/octet-stream".to_string()
+}
+
+fn normalize_media_content_type(content_type: Option<&str>, media_kind: &str) -> Option<&'static str> {
+    let mime = content_type
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+
+    match mime {
+        "image/png" => Some("image/png"),
+        "image/jpeg" => Some("image/jpeg"),
+        "image/gif" => Some("image/gif"),
+        "image/webp" => Some("image/webp"),
+        "image/bmp" => Some("image/bmp"),
+        "image/svg+xml" => Some("image/svg+xml"),
+        "image/x-icon" => Some("image/x-icon"),
+        "audio/amr" | "audio/amr-wb" | "application/amr" => Some("audio/amr"),
+        "audio/wav" | "audio/x-wav" => Some("audio/wav"),
+        "audio/mpeg" => Some("audio/mpeg"),
+        "audio/mp4" => Some("audio/mp4"),
+        "audio/aac" => Some("audio/aac"),
+        "audio/ogg" => Some("audio/ogg"),
+        "audio/opus" => Some("audio/opus"),
+        "video/mp4" => Some("video/mp4"),
+        "video/webm" => Some("video/webm"),
+        "video/quicktime" => Some("video/quicktime"),
+        "application/pdf" => Some("application/pdf"),
+        "application/octet-stream" => {
+            if media_kind.eq_ignore_ascii_case("file") {
+                Some("application/octet-stream")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn normalize_image_content_type(content_type: &str) -> Option<&'static str> {
     let mime = content_type
         .split(';')
@@ -894,6 +1179,14 @@ fn guess_image_mime_type(bytes: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn looks_like_amr(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"#!AMR")
+}
+
+fn looks_like_mp4(bytes: &[u8]) -> bool {
+    bytes.len() >= 12 && bytes[4..8] == *b"ftyp"
 }
 
 async fn maybe_forward_to_lowcode_agent(
@@ -1510,14 +1803,14 @@ mod tests {
     use super::{
         ACTIVATE_RECENT_ACTION, DownloadedImageData, InboundCommand, SessionControlSuccess,
         build_command_list_text, build_image_data_url, build_lowcode_inbound_content,
-        build_session_list_text, build_wechat_cdn_download_url,
+        build_media_file_name, build_session_list_text, build_wechat_cdn_download_url,
         channel_gateway_response_is_success, decode_wechat_aes_key_hex, decrypt_aes_ecb,
-        detect_inbound_command, effective_inline_image_max_bytes,
+        detect_inbound_command, effective_inline_image_max_bytes, guess_extension_from_mime,
         extract_session_control_success, extract_wechat_media_aes_key, guess_image_mime_type,
-        has_media_items, normalize_assistant_name,
+        has_media_items, looks_like_amr, looks_like_mp4, normalize_assistant_name,
         normalize_command_text, normalize_image_content_type, normalize_preview_text,
-        parse_recent_session_index, replace_image_part_url, resolve_recent_session_record,
-        session_control_success_reply_text,
+        parse_recent_session_index, replace_file_part_url, replace_image_part_url,
+        resolve_media_mime_type, resolve_recent_session_record, session_control_success_reply_text,
     };
     use crate::channel_session_client::ChannelSessionRecord;
     use crate::config::CommandActionConfig;
@@ -1717,6 +2010,28 @@ mod tests {
     }
 
     #[test]
+    fn replaces_file_part_url_without_changing_media_type() {
+        let part = json!({
+            "type": "file",
+            "file": {
+                "url": "https://example.com/original.bin"
+            },
+            "mediaType": "file",
+            "source": "wechat"
+        });
+
+        let updated = replace_file_part_url(part, "https://example.com/uploaded.bin");
+
+        assert_eq!(updated["type"], "file");
+        assert_eq!(
+            updated["file"],
+            json!({"url": "https://example.com/uploaded.bin"})
+        );
+        assert_eq!(updated["mediaType"], "file");
+        assert_eq!(updated["source"], "wechat");
+    }
+
+    #[test]
     fn builds_image_data_url_from_downloaded_bytes() {
         let image = DownloadedImageData {
             bytes: b"png-bytes".to_vec(),
@@ -1726,6 +2041,66 @@ mod tests {
             build_image_data_url(&image),
             "data:image/png;base64,cG5nLWJ5dGVz"
         );
+    }
+
+    #[test]
+    fn builds_media_file_name_from_wechat_file_name_or_media_kind() {
+        let part = json!({
+            "wechatMedia": {
+                "file_name": "report"
+            }
+        });
+        assert_eq!(
+            build_media_file_name(&part, "https://example.com/raw", "application/pdf", "file"),
+            "report.pdf"
+        );
+
+        let part = json!({
+            "wechatMedia": {}
+        });
+        assert_eq!(
+            build_media_file_name(&part, "https://example.com/path/voice", "audio/amr", "audio"),
+            "voice.amr"
+        );
+        assert_eq!(
+            build_media_file_name(&part, "", "application/octet-stream", "file"),
+            "wechat_file.bin"
+        );
+    }
+
+    #[test]
+    fn resolves_media_mime_type_for_audio_video_and_file() {
+        assert_eq!(
+            resolve_media_mime_type(Some("audio/mpeg"), b"", "audio"),
+            "audio/mpeg"
+        );
+        assert_eq!(
+            resolve_media_mime_type(None, b"#!AMR\npayload", "audio"),
+            "audio/amr"
+        );
+        assert_eq!(
+            resolve_media_mime_type(None, b"\x00\x00\x00\x18ftypisomrest", "video"),
+            "video/mp4"
+        );
+        assert_eq!(
+            resolve_media_mime_type(Some("application/octet-stream"), b"raw", "file"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn guesses_extensions_for_common_media_types() {
+        assert_eq!(guess_extension_from_mime("audio/amr"), "amr");
+        assert_eq!(guess_extension_from_mime("video/mp4"), "mp4");
+        assert_eq!(guess_extension_from_mime("application/octet-stream"), "bin");
+    }
+
+    #[test]
+    fn detects_amr_and_mp4_signatures() {
+        assert!(looks_like_amr(b"#!AMR\nrest"));
+        assert!(!looks_like_amr(b"not-amr"));
+        assert!(looks_like_mp4(b"\x00\x00\x00\x18ftypisomrest"));
+        assert!(!looks_like_mp4(b"short"));
     }
 
     #[test]

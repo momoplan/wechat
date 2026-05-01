@@ -29,7 +29,7 @@ struct CompletedFileUpload {
     download_url: String,
 }
 
-pub async fn upload_image_bytes(
+pub async fn upload_bytes(
     state: &Arc<AppState>,
     tenant: &Arc<TenantContext>,
     workspace_id: &str,
@@ -40,8 +40,8 @@ pub async fn upload_image_bytes(
 ) -> Result<ProjectFileUploadResult, ServiceError> {
     let route_base = resolve_gateway_route_base(tenant).await?;
     let gateway_token = resolve_gateway_token(state, tenant).await;
-    let size =
-        u64::try_from(bytes.len()).map_err(|_| ServiceError::BadRequest("图片过大".to_string()))?;
+    let size = u64::try_from(bytes.len())
+        .map_err(|_| ServiceError::BadRequest("项目文件过大".to_string()))?;
     let prepared = prepare_file_upload(
         state,
         &route_base,
@@ -79,6 +79,27 @@ pub async fn upload_image_bytes(
     })
 }
 
+pub async fn upload_image_bytes(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    workspace_id: &str,
+    channel_user_id: &str,
+    file_name: &str,
+    content_type: &str,
+    bytes: &[u8],
+) -> Result<ProjectFileUploadResult, ServiceError> {
+    upload_bytes(
+        state,
+        tenant,
+        workspace_id,
+        channel_user_id,
+        file_name,
+        content_type,
+        bytes,
+    )
+    .await
+}
+
 async fn prepare_file_upload(
     state: &AppState,
     route_base: &str,
@@ -98,7 +119,7 @@ async fn prepare_file_upload(
         "contentType": content_type,
         "size": size,
     });
-    request_gateway_json(state, &endpoint, gateway_token, &payload, "申请图片上传凭证").await
+    request_gateway_json(state, &endpoint, gateway_token, &payload, "申请项目文件上传凭证").await
 }
 
 async fn complete_file_upload(
@@ -116,7 +137,7 @@ async fn complete_file_upload(
         "channelUserId": channel_user_id,
         "uploadKey": upload_key,
     });
-    request_gateway_json(state, &endpoint, gateway_token, &payload, "完成图片上传").await
+    request_gateway_json(state, &endpoint, gateway_token, &payload, "完成项目文件上传").await
 }
 
 async fn request_gateway_json<T: for<'de> Deserialize<'de>>(

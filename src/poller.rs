@@ -436,19 +436,19 @@ fn build_lowcode_inbound_content(msg: &Value) -> Option<Value> {
                 }
             }
             2 => {
-                parts.push(build_media_content_part(item, "image_url", "image"));
+                parts.push(build_media_content_part(item, "image_url"));
                 has_media = true;
             }
             3 => {
-                parts.push(build_media_content_part(item, "file", "audio"));
+                parts.push(build_media_content_part(item, "file"));
                 has_media = true;
             }
             4 => {
-                parts.push(build_media_content_part(item, "file", "file"));
+                parts.push(build_media_content_part(item, "file"));
                 has_media = true;
             }
             5 => {
-                parts.push(build_media_content_part(item, "file", "video"));
+                parts.push(build_media_content_part(item, "file"));
                 has_media = true;
             }
             _ => {}
@@ -475,12 +475,14 @@ fn build_lowcode_inbound_content(msg: &Value) -> Option<Value> {
     }
 }
 
-fn build_media_content_part(item: &Value, part_type: &str, media_kind: &str) -> Value {
-    let detail_key = match media_kind {
-        "image" => "image_item",
-        "audio" => "voice_item",
-        "video" => "video_item",
-        "file" => "file_item",
+fn build_media_content_part(item: &Value, part_type: &str) -> Value {
+    let detail_key = match part_type {
+        "image_url" => "image_item",
+        "file" => match item.get("type").and_then(Value::as_i64).unwrap_or_default() {
+            3 => "voice_item",
+            5 => "video_item",
+            _ => "file_item",
+        },
         _ => "media_item",
     };
     let detail = item.get(detail_key).cloned().unwrap_or(Value::Null);
@@ -495,7 +497,6 @@ fn build_media_content_part(item: &Value, part_type: &str, media_kind: &str) -> 
     let mut part = json!({
         "type": part_type,
         "source": "wechat",
-        "mediaType": media_kind,
         "wechatMedia": detail,
     });
 
@@ -600,42 +601,37 @@ fn classify_inbound_media_part(part: &Value) -> Option<InboundMediaDescriptor<'s
         .and_then(Value::as_str)
         .map(str::trim)
         .unwrap_or_default();
-    let media_kind = part
-        .get("mediaType")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .unwrap_or_default();
-
     let url_key = if part_type.eq_ignore_ascii_case("image_url")
         || part_type.eq_ignore_ascii_case("input_image")
     {
         Some("image_url")
     } else if part_type.eq_ignore_ascii_case("file")
-        || part_type.eq_ignore_ascii_case("file_url")
         || part_type.eq_ignore_ascii_case("input_file")
-        || part_type.eq_ignore_ascii_case("audio_url")
-        || part_type.eq_ignore_ascii_case("input_audio")
-        || part_type.eq_ignore_ascii_case("voice_url")
-        || part_type.eq_ignore_ascii_case("input_voice")
-        || part_type.eq_ignore_ascii_case("video_url")
     {
         Some("file")
     } else {
         None
     }?;
 
-    let kind = if media_kind.eq_ignore_ascii_case("image") || url_key == "image_url" {
+    let kind = if url_key == "image_url" {
         "image"
-    } else if media_kind.eq_ignore_ascii_case("audio") {
-        "audio"
-    } else if media_kind.eq_ignore_ascii_case("video") {
-        "video"
     } else {
-        "file"
+        infer_file_media_kind(part)
     };
 
     let url = extract_part_url(part, url_key)?;
     Some(InboundMediaDescriptor { kind, url })
+}
+
+fn infer_file_media_kind(part: &Value) -> &'static str {
+    let wechat_media = part.get("wechatMedia").unwrap_or(part);
+    if wechat_media.get("playtime").is_some() || wechat_media.get("voice_text").is_some() {
+        "audio"
+    } else if wechat_media.get("video_size").is_some() {
+        "video"
+    } else {
+        "file"
+    }
 }
 
 fn extract_part_url(part: &Value, key: &str) -> Option<String> {
@@ -1807,7 +1803,7 @@ mod tests {
         channel_gateway_response_is_success, decode_wechat_aes_key_hex, decrypt_aes_ecb,
         detect_inbound_command, effective_inline_image_max_bytes, guess_extension_from_mime,
         extract_session_control_success, extract_wechat_media_aes_key, guess_image_mime_type,
-        has_media_items, looks_like_amr, looks_like_mp4, normalize_assistant_name,
+        has_media_items, infer_file_media_kind, looks_like_amr, looks_like_mp4, normalize_assistant_name,
         normalize_command_text, normalize_image_content_type, normalize_preview_text,
         parse_recent_session_index, replace_file_part_url, replace_image_part_url,
         resolve_media_mime_type, resolve_recent_session_record, session_control_success_reply_text,
@@ -1894,11 +1890,11 @@ mod tests {
         let content = build_lowcode_inbound_content(&msg).unwrap();
         assert_eq!(content[0]["text"], "(video)");
         assert_eq!(content[1]["type"], "file");
-        assert_eq!(content[1]["mediaType"], "video");
         assert_eq!(
             content[1]["file"]["url"],
             build_wechat_cdn_download_url("video-token")
         );
+        assert_eq!(infer_file_media_kind(&content[1]), "video");
     }
 
     #[test]
@@ -1924,12 +1920,12 @@ mod tests {
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "帮我再装一个小象萨斯");
         assert_eq!(content[1]["type"], "file");
-        assert_eq!(content[1]["mediaType"], "audio");
         assert_eq!(
             content[1]["file"]["url"],
             build_wechat_cdn_download_url("voice-token")
         );
         assert_eq!(content[1]["wechatMedia"]["playtime"], 3760);
+        assert_eq!(infer_file_media_kind(&content[1]), "audio");
     }
 
     #[test]
@@ -1991,7 +1987,6 @@ mod tests {
             "image_url": {
                 "url": "https://example.com/original.png"
             },
-            "mediaType": "image",
             "source": "wechat",
             "wechatMedia": {
                 "mid_size": 123
@@ -2005,7 +2000,6 @@ mod tests {
             updated["image_url"],
             json!({"url": "https://example.com/original.png"})
         );
-        assert_eq!(updated["mediaType"], "image");
         assert_eq!(updated["source"], "wechat");
     }
 
@@ -2016,7 +2010,6 @@ mod tests {
             "file": {
                 "url": "https://example.com/original.bin"
             },
-            "mediaType": "file",
             "source": "wechat"
         });
 
@@ -2027,7 +2020,6 @@ mod tests {
             updated["file"],
             json!({"url": "https://example.com/uploaded.bin"})
         );
-        assert_eq!(updated["mediaType"], "file");
         assert_eq!(updated["source"], "wechat");
     }
 

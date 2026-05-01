@@ -1,0 +1,180 @@
+use crate::error::ServiceError;
+use crate::state::{AppState, TenantContext};
+use serde::Deserialize;
+use serde_json::json;
+use std::sync::Arc;
+
+const GET_CHANNEL_USER_BINDING_METHOD: &str = "getChannelUserBinding";
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelUserBinding {
+    pub workspace_id: String,
+    pub channel: String,
+    pub channel_user_id: String,
+    pub internal_user_id: String,
+    pub project_id: String,
+    pub enabled: bool,
+}
+
+pub async fn get_channel_user_binding(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    channel_user_id: &str,
+) -> Result<ChannelUserBinding, ServiceError> {
+    let credential = tenant.credential.read().await.clone();
+    let gateway_url = credential
+        .lowcode_ws_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| ServiceError::BadRequest("租户未配置 gateway_url".to_string()))?;
+    let route_base = normalize_gateway_route_base(gateway_url)?;
+    let workspace_id = resolve_workspace_id(gateway_url).ok_or_else(|| {
+        ServiceError::BadRequest("无法从 gateway_url 推导 workspaceId".to_string())
+    })?;
+    let gateway_token = credential.lowcode_ws_token.clone().or_else(|| {
+        state
+            .config
+            .channel_gateway
+            .inbound_token
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+    });
+    let endpoint = format!("{route_base}/{GET_CHANNEL_USER_BINDING_METHOD}");
+    let payload = json!({
+        "workspaceId": workspace_id,
+        "channel": "wechat",
+        "channelUserId": channel_user_id,
+    });
+
+    let mut request = state.http_client.post(&endpoint).json(&payload);
+    if let Some(token) = gateway_token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+
+    let response = request.send().await.map_err(|err| {
+        ServiceError::Upstream(format!("查询 channel-gateway 用户绑定失败: {err}"))
+    })?;
+    let status = response.status();
+    let raw_body = response.text().await.map_err(|err| {
+        ServiceError::Upstream(format!("读取 channel-gateway 用户绑定响应失败: {err}"))
+    })?;
+    if !status.is_success() {
+        return Err(map_gateway_error(
+            status.as_u16(),
+            &raw_body,
+            "查询 channel-gateway 用户绑定失败",
+        ));
+    }
+
+    serde_json::from_str::<ChannelUserBinding>(&raw_body).map_err(|err| {
+        ServiceError::Upstream(format!(
+            "解析 channel-gateway 用户绑定响应失败: {err}; body={raw_body}"
+        ))
+    })
+}
+
+fn normalize_gateway_route_base(gateway_url: &str) -> Result<String, ServiceError> {
+    let trimmed = gateway_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(ServiceError::BadRequest(
+            "租户未配置 gateway_url".to_string(),
+        ));
+    }
+
+    let route_base = if trimmed.ends_with("/inbound") {
+        trimmed.trim_end_matches("/inbound").trim_end_matches('/')
+    } else {
+        trimmed
+    };
+
+    if route_base.is_empty() {
+        return Err(ServiceError::BadRequest(
+            "租户未配置 gateway_url".to_string(),
+        ));
+    }
+
+    Ok(route_base.to_string())
+}
+
+fn resolve_workspace_id(gateway_url: &str) -> Option<String> {
+    let trimmed = gateway_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let segments: Vec<&str> = trimmed.split('/').filter(|segment| !segment.is_empty()).collect();
+    if let Some(index) = segments.iter().position(|segment| *segment == "workspaces")
+        && let Some(workspace) = segments.get(index + 1)
+    {
+        let workspace = workspace.trim();
+        if !workspace.is_empty() {
+            return Some(workspace.to_string());
+        }
+    }
+
+    segments
+        .iter()
+        .rev()
+        .find_map(|segment| segment.strip_prefix("svc-channel-gateway-ws-"))
+        .map(str::trim)
+        .filter(|workspace| !workspace.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn map_gateway_error(status: u16, raw_body: &str, prefix: &str) -> ServiceError {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_body) {
+        if let Some(message) = extract_gateway_error_message(&value) {
+            return match status {
+                400 => ServiceError::BadRequest(message),
+                401 | 403 => ServiceError::Unauthorized(message),
+                404 => ServiceError::NotFound(message),
+                _ => ServiceError::Upstream(format!("{prefix}: {message}")),
+            };
+        }
+    }
+    ServiceError::Upstream(format!("{prefix}: status={status} body={raw_body}"))
+}
+
+fn extract_gateway_error_message(value: &serde_json::Value) -> Option<String> {
+    [
+        "/message",
+        "/error",
+        "/value",
+        "/data/message",
+        "/data/error",
+    ]
+    .iter()
+    .find_map(|pointer| {
+        value
+            .pointer(pointer)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(ToOwned::to_owned)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_workspace_id;
+
+    #[test]
+    fn resolves_workspace_id_from_workspace_route() {
+        assert_eq!(
+            resolve_workspace_id("http://127.0.0.1:4020/workspaces/acme/channels/wechat/inbound")
+                .as_deref(),
+            Some("acme")
+        );
+    }
+
+    #[test]
+    fn resolves_workspace_id_from_service_route() {
+        assert_eq!(
+            resolve_workspace_id("https://gateway.example.com/svc-channel-gateway-ws-1182")
+                .as_deref(),
+            Some("1182")
+        );
+    }
+}

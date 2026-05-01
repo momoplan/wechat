@@ -1,9 +1,11 @@
+mod channel_binding_client;
 mod channel_session_client;
 mod config;
 mod error;
 mod logging;
 mod models;
 mod poller;
+mod project_file_client;
 mod routes;
 mod state;
 mod storage;

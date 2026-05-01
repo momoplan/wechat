@@ -543,6 +543,80 @@ fn infer_media_kind_from_content_type(value: Option<&str>) -> Option<MediaKind> 
     }
 }
 
+fn file_extension_from_content_type(value: &str) -> &'static str {
+    let content_type = value
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default();
+    match content_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/mpeg" => "mp3",
+        "audio/mp4" => "m4a",
+        "audio/aac" => "aac",
+        "audio/ogg" => "ogg",
+        "audio/opus" => "opus",
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
+        "video/quicktime" => "mov",
+        "application/pdf" => "pdf",
+        _ => "bin",
+    }
+}
+
+fn parse_data_url_payload(
+    data_url: &str,
+    file_name: Option<&str>,
+    media_type: Option<&str>,
+) -> Result<Option<MediaPayload>, ServiceError> {
+    let trimmed = data_url.trim();
+    if !trimmed.starts_with("data:") {
+        return Ok(None);
+    }
+
+    let (metadata, encoded) = trimmed
+        .split_once(',')
+        .ok_or_else(|| ServiceError::BadRequest("media_url 非法: data URL 缺少数据段".to_string()))?;
+    let is_base64 = metadata
+        .rsplit(';')
+        .next()
+        .map(|value| value.eq_ignore_ascii_case("base64"))
+        .unwrap_or(false);
+    if !is_base64 {
+        return Err(ServiceError::BadRequest(
+            "media_url 非法: 当前只支持 base64 data URL".to_string(),
+        ));
+    }
+
+    let content_type = metadata
+        .strip_prefix("data:")
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("application/octet-stream");
+    let bytes = BASE64_STANDARD.decode(encoded).map_err(|err| {
+        ServiceError::BadRequest(format!("media_url 非法: data URL base64 解码失败: {err}"))
+    })?;
+    let fallback_name = file_name
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("media.{}", file_extension_from_content_type(content_type)));
+    let kind = MediaKind::from_hint(media_type)
+        .or_else(|| infer_media_kind_from_content_type(Some(content_type)))
+        .unwrap_or_else(|| infer_media_kind_from_name(&fallback_name));
+    Ok(Some(MediaPayload {
+        bytes,
+        file_name: fallback_name,
+        media_kind: kind,
+    }))
+}
+
 fn file_name_from_url(url: &reqwest::Url) -> Option<String> {
     url.path_segments()
         .and_then(|segments| segments.last())
@@ -559,6 +633,9 @@ async fn load_media_payload(
     media_type: Option<&str>,
 ) -> Result<MediaPayload, ServiceError> {
     if let Some(url) = media_url.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(payload) = parse_data_url_payload(url, file_name, media_type)? {
+            return Ok(payload);
+        }
         let parsed = reqwest::Url::parse(url)
             .map_err(|err| ServiceError::BadRequest(format!("media_url 非法: {err}")))?;
         let response = state
@@ -789,7 +866,7 @@ pub async fn fetch_login_qrcode(
 mod tests {
     use super::{
         MediaKind, MediaPayload, UploadedMedia, build_media_item, classify_login_qr_content,
-        infer_media_kind_from_content_type, infer_media_kind_from_name,
+        infer_media_kind_from_content_type, infer_media_kind_from_name, parse_data_url_payload,
         normalize_login_qr_image_data_url, preview_login_qr_content,
     };
     use serde_json::json;
@@ -838,6 +915,27 @@ mod tests {
             preview_login_qr_content("data:image/png;base64,abcdefghijklmnopqrstuvwxyz"),
             "data:image/png;base64,ab..."
         );
+    }
+
+    #[test]
+    fn parses_base64_data_image_as_media_payload() {
+        let payload = parse_data_url_payload(
+            "data:image/png;base64,YWJjZA==",
+            None,
+            Some("image"),
+        )
+        .expect("parse data url")
+        .expect("data url payload");
+        assert_eq!(payload.bytes, b"abcd");
+        assert_eq!(payload.file_name, "media.png");
+        assert_eq!(payload.media_kind, MediaKind::Image);
+    }
+
+    #[test]
+    fn rejects_non_base64_data_url() {
+        let err = parse_data_url_payload("data:image/png,abcd", None, None)
+            .expect_err("should reject non-base64 data url");
+        assert!(err.to_string().contains("只支持 base64 data URL"));
     }
 
     #[test]

@@ -1,6 +1,8 @@
+use crate::channel_binding_client;
 use crate::channel_session_client::{self, ChannelSessionRecord};
 use crate::config::CommandActionConfig;
 use crate::models::ReceivedEvent;
+use crate::project_file_client;
 use crate::state::{AppState, TenantContext};
 use crate::wechat_api;
 use aes::Aes128;
@@ -44,6 +46,12 @@ struct InboundCommand {
 struct SessionControlSuccess {
     action: String,
     session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DownloadedImageData {
+    bytes: Vec<u8>,
+    mime: &'static str,
 }
 
 pub async fn run_tenant_poll_worker(
@@ -241,7 +249,7 @@ async fn handle_inbound_message(state: &Arc<AppState>, tenant: &Arc<TenantContex
         );
         return;
     };
-    let inbound_content = inline_inbound_images(state, tenant, inbound_content).await;
+    let inbound_content = inline_inbound_images(state, tenant, &from_user_id, inbound_content).await;
 
     maybe_forward_to_lowcode_agent(
         state,
@@ -519,6 +527,7 @@ fn build_wechat_cdn_download_url(encrypted_query_param: &str) -> String {
 async fn inline_inbound_images(
     state: &Arc<AppState>,
     tenant: &Arc<TenantContext>,
+    channel_user_id: &str,
     content: Value,
 ) -> Value {
     let Some(parts) = content.as_array() else {
@@ -529,7 +538,9 @@ async fn inline_inbound_images(
         effective_inline_image_max_bytes(state.config.runtime.max_inline_image_bytes);
     let mut updated = Vec::with_capacity(parts.len());
     for part in parts {
-        updated.push(inline_image_part(state, tenant, part.clone(), max_inline_bytes).await);
+        updated.push(
+            inline_image_part(state, tenant, channel_user_id, part.clone(), max_inline_bytes).await,
+        );
     }
 
     Value::Array(updated)
@@ -542,6 +553,7 @@ fn effective_inline_image_max_bytes(configured_max: usize) -> usize {
 async fn inline_image_part(
     state: &Arc<AppState>,
     tenant: &Arc<TenantContext>,
+    channel_user_id: &str,
     part: Value,
     max_inline_bytes: usize,
 ) -> Value {
@@ -570,77 +582,92 @@ async fn inline_image_part(
         return part;
     };
 
-    match build_inline_image_data_url(state, &part, &original_url, max_inline_bytes).await {
-        Ok(Some(data_url)) => {
-            mark_image_part_transfer(part, Value::String(data_url), "inline_data_url")
+    match download_wechat_image_data(state, &part, &original_url).await {
+        Ok(downloaded) if downloaded.bytes.len() <= max_inline_bytes => {
+            replace_image_part_url(part, build_image_data_url(&downloaded))
         }
-        Ok(None) => {
+        Ok(downloaded) => match upload_wechat_image_part(
+            state,
+            tenant,
+            channel_user_id,
+            &part,
+            &original_url,
+            &downloaded,
+        )
+        .await
+        {
+            Ok(uploaded_url) => replace_image_part_url(part, uploaded_url),
+            Err(err) => {
+                warn!(
+                    tenant_id = %tenant.tenant_id,
+                    error = %err,
+                    max_inline_bytes,
+                    "微信图片超过内联大小上限，上传失败，保留原始远端地址"
+                );
+                replace_image_part_url(part, original_url.clone())
+            }
+        },
+        Err(err) if err == "IMAGE_TOO_LARGE_BY_CONTENT_LENGTH" => {
             warn!(
                 tenant_id = %tenant.tenant_id,
                 max_inline_bytes,
-                "微信图片超过内联大小上限，改走文件透传"
+                "微信图片响应头已超过内联大小上限，改走上传"
             );
-            convert_image_part_to_file_fallback(
-                part,
-                Value::String(original_url.clone()),
-                "file_url_fallback",
-            )
+            match download_wechat_image_data_force(state, &part, &original_url).await {
+                Ok(downloaded) => match upload_wechat_image_part(
+                    state,
+                    tenant,
+                    channel_user_id,
+                    &part,
+                    &original_url,
+                    &downloaded,
+                )
+                .await
+                {
+                    Ok(uploaded_url) => replace_image_part_url(part, uploaded_url),
+                    Err(upload_err) => {
+                        warn!(
+                            tenant_id = %tenant.tenant_id,
+                            error = %upload_err,
+                            "微信图片上传失败，保留原始远端地址"
+                        );
+                        replace_image_part_url(part, original_url.clone())
+                    }
+                },
+                Err(force_err) => {
+                    warn!(
+                        tenant_id = %tenant.tenant_id,
+                        error = %force_err,
+                        "微信图片重新下载失败，保留原始远端地址"
+                    );
+                    replace_image_part_url(part, original_url.clone())
+                }
+            }
         }
         Err(err) => {
             warn!(
                 tenant_id = %tenant.tenant_id,
                 error = %err,
-                "微信图片内联失败，改走文件透传"
+                "微信图片处理失败，保留原始远端地址"
             );
-            convert_image_part_to_file_fallback(
-                part,
-                Value::String(original_url),
-                "file_url_fallback",
-            )
+            replace_image_part_url(part, original_url)
         }
     }
 }
 
-fn mark_image_part_transfer(mut part: Value, image_url: Value, transfer: &str) -> Value {
+fn replace_image_part_url(mut part: Value, image_url: impl Into<String>) -> Value {
     let Some(object) = part.as_object_mut() else {
         return part;
     };
-    let normalized_image_url = match image_url {
-        Value::String(url) => json!({ "url": url }),
-        other => other,
-    };
-    object.insert("image_url".to_string(), normalized_image_url);
-    object.insert(
-        "imageTransfer".to_string(),
-        Value::String(transfer.to_string()),
-    );
+    object.insert("image_url".to_string(), json!({ "url": image_url.into() }));
     part
 }
 
-fn convert_image_part_to_file_fallback(mut part: Value, file_url: Value, transfer: &str) -> Value {
-    let Some(object) = part.as_object_mut() else {
-        return part;
-    };
-    let normalized_file_url = match file_url {
-        Value::String(url) => json!({ "url": url }),
-        other => other,
-    };
-    object.insert("type".to_string(), Value::String("file".to_string()));
-    object.remove("image_url");
-    object.insert("file".to_string(), normalized_file_url);
-    object.insert(
-        "imageTransfer".to_string(),
-        Value::String(transfer.to_string()),
-    );
-    part
-}
-
-async fn build_inline_image_data_url(
+async fn download_wechat_image_data(
     state: &Arc<AppState>,
     part: &Value,
     download_url: &str,
-    max_inline_bytes: usize,
-) -> Result<Option<String>, String> {
+) -> Result<DownloadedImageData, String> {
     let response = state
         .http_client
         .get(download_url)
@@ -649,11 +676,31 @@ async fn build_inline_image_data_url(
         .map_err(|err| format!("下载微信图片失败: {err}"))?;
 
     if let Some(length) = response.content_length()
-        && length > max_inline_bytes as u64
+        && length > MAX_TRANSPORT_INLINE_IMAGE_BYTES as u64
     {
-        return Ok(None);
+        return Err("IMAGE_TOO_LARGE_BY_CONTENT_LENGTH".to_string());
     }
+    finalize_wechat_image_download(part, response).await
+}
 
+async fn download_wechat_image_data_force(
+    state: &Arc<AppState>,
+    part: &Value,
+    download_url: &str,
+) -> Result<DownloadedImageData, String> {
+    let response = state
+        .http_client
+        .get(download_url)
+        .send()
+        .await
+        .map_err(|err| format!("下载微信图片失败: {err}"))?;
+    finalize_wechat_image_download(part, response).await
+}
+
+async fn finalize_wechat_image_download(
+    part: &Value,
+    response: reqwest::Response,
+) -> Result<DownloadedImageData, String> {
     let status = response.status();
     if !status.is_success() {
         let body = response
@@ -677,16 +724,81 @@ async fn build_inline_image_data_url(
         .await
         .map_err(|err| format!("读取微信图片失败: {err}"))?;
     let bytes = maybe_decrypt_wechat_media(part, bytes.as_ref())?;
-
-    if bytes.len() > max_inline_bytes {
-        return Ok(None);
-    }
-
     let mime = resolve_image_mime_type(content_type.as_deref(), bytes.as_ref());
-    Ok(Some(format!(
-        "data:{mime};base64,{}",
-        BASE64_STANDARD.encode(bytes)
-    )))
+    Ok(DownloadedImageData { bytes, mime })
+}
+
+fn build_image_data_url(image: &DownloadedImageData) -> String {
+    format!(
+        "data:{};base64,{}",
+        image.mime,
+        BASE64_STANDARD.encode(&image.bytes)
+    )
+}
+
+async fn upload_wechat_image_part(
+    state: &Arc<AppState>,
+    tenant: &Arc<TenantContext>,
+    channel_user_id: &str,
+    part: &Value,
+    original_url: &str,
+    downloaded: &DownloadedImageData,
+) -> Result<String, String> {
+    let binding = channel_binding_client::get_channel_user_binding(state, tenant, channel_user_id)
+        .await
+        .map_err(|err| err.to_string())?;
+    let file_name = build_image_file_name(part, original_url, downloaded.mime);
+    let uploaded = project_file_client::upload_image_bytes(
+        state,
+        tenant,
+        &binding.workspace_id,
+        channel_user_id,
+        &file_name,
+        downloaded.mime,
+        &downloaded.bytes,
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+    Ok(uploaded.download_url)
+}
+
+fn build_image_file_name(part: &Value, original_url: &str, mime: &str) -> String {
+    let base = part
+        .get("wechatMedia")
+        .and_then(Value::as_object)
+        .and_then(|media| media.get("file_name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            original_url
+                .split('?')
+                .next()
+                .and_then(|value| value.rsplit('/').next())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "wechat_image".to_string());
+    if base.contains('.') {
+        base
+    } else {
+        format!("{base}.{}", guess_extension_from_mime(mime))
+    }
+}
+
+fn guess_extension_from_mime(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/svg+xml" => "svg",
+        "image/x-icon" => "ico",
+        _ => "png",
+    }
 }
 
 fn maybe_decrypt_wechat_media(part: &Value, bytes: &[u8]) -> Result<Vec<u8>, String> {
@@ -1396,22 +1508,22 @@ fn session_control_success_reply_text(action: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVATE_RECENT_ACTION, InboundCommand, SessionControlSuccess, build_command_list_text,
-        build_lowcode_inbound_content, build_session_list_text, build_wechat_cdn_download_url,
-        channel_gateway_response_is_success, convert_image_part_to_file_fallback,
-        decode_wechat_aes_key_hex, decrypt_aes_ecb, detect_inbound_command,
-        effective_inline_image_max_bytes, extract_session_control_success,
-        extract_wechat_media_aes_key, guess_image_mime_type, has_media_items,
-        mark_image_part_transfer, normalize_assistant_name, normalize_command_text,
-        normalize_image_content_type, normalize_preview_text, parse_recent_session_index,
-        resolve_recent_session_record, session_control_success_reply_text,
+        ACTIVATE_RECENT_ACTION, DownloadedImageData, InboundCommand, SessionControlSuccess,
+        build_command_list_text, build_image_data_url, build_lowcode_inbound_content,
+        build_session_list_text, build_wechat_cdn_download_url,
+        channel_gateway_response_is_success, decode_wechat_aes_key_hex, decrypt_aes_ecb,
+        detect_inbound_command, effective_inline_image_max_bytes,
+        extract_session_control_success, extract_wechat_media_aes_key, guess_image_mime_type,
+        has_media_items, normalize_assistant_name,
+        normalize_command_text, normalize_image_content_type, normalize_preview_text,
+        parse_recent_session_index, replace_image_part_url, resolve_recent_session_record,
+        session_control_success_reply_text,
     };
     use crate::channel_session_client::ChannelSessionRecord;
     use crate::config::CommandActionConfig;
     use aes::Aes128;
     use aes::cipher::{BlockEncryptMut, KeyInit, block_padding::Pkcs7};
     use ecb::Encryptor;
-    use serde_json::Value;
     use serde_json::json;
 
     type Aes128EcbEnc = Encryptor<Aes128>;
@@ -1561,7 +1673,7 @@ mod tests {
     }
 
     #[test]
-    fn marks_image_part_with_inline_transfer_metadata() {
+    fn replaces_image_part_with_inline_data_url() {
         let part = json!({
             "type": "image_url",
             "image_url": {
@@ -1570,22 +1682,17 @@ mod tests {
             "source": "wechat"
         });
 
-        let updated = mark_image_part_transfer(
-            part,
-            Value::String("data:image/png;base64,AAAA".to_string()),
-            "inline_data_url",
-        );
+        let updated = replace_image_part_url(part, "data:image/png;base64,AAAA");
 
         assert_eq!(
             updated["image_url"],
             json!({"url": "data:image/png;base64,AAAA"})
         );
-        assert_eq!(updated["imageTransfer"], "inline_data_url");
         assert_eq!(updated["source"], "wechat");
     }
 
     #[test]
-    fn converts_oversized_image_part_to_file_fallback() {
+    fn preserves_remote_image_part_without_extra_metadata() {
         let part = json!({
             "type": "image_url",
             "image_url": {
@@ -1598,21 +1705,27 @@ mod tests {
             }
         });
 
-        let updated = convert_image_part_to_file_fallback(
-            part,
-            Value::String("https://example.com/original.png".to_string()),
-            "file_url_fallback",
-        );
+        let updated = replace_image_part_url(part, "https://example.com/original.png");
 
-        assert_eq!(updated["type"], "file");
+        assert_eq!(updated["type"], "image_url");
         assert_eq!(
-            updated["file"],
+            updated["image_url"],
             json!({"url": "https://example.com/original.png"})
         );
         assert_eq!(updated["mediaType"], "image");
-        assert_eq!(updated["imageTransfer"], "file_url_fallback");
         assert_eq!(updated["source"], "wechat");
-        assert!(updated.get("image_url").is_none());
+    }
+
+    #[test]
+    fn builds_image_data_url_from_downloaded_bytes() {
+        let image = DownloadedImageData {
+            bytes: b"png-bytes".to_vec(),
+            mime: "image/png",
+        };
+        assert_eq!(
+            build_image_data_url(&image),
+            "data:image/png;base64,cG5nLWJ5dGVz"
+        );
     }
 
     #[test]
